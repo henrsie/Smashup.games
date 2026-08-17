@@ -104,7 +104,6 @@ const factionsData = {
     cards: [
       // Minions (Total: 10)
       { id: 'wizard_archmage_1', name: 'Archmage', type: 'minion', power: 4, count: 1, ability: 'Ongoing: You may play an extra action on each of your turns.', subtype: 'base', discard: 'no' },
-      { id: 'wizard_archmage_2', name: 'Archmage', type: 'minion', power: 4, count: 1, ability: 'Talent: Play an extra action.', subtype: 'base', discard: 'no' },
       { id: 'wizard_chronomage_1', name: 'Chronomage', type: 'minion', power: 3, count: 2, ability: 'You may play an extra action this turn.', subtype: 'base', discard: 'no' },
       { id: 'wizard_enchantress_1', name: 'Enchantress', type: 'minion', power: 2, count: 3, ability: 'Draw a card.', subtype: 'base', discard: 'no' },
       { id: 'wizard_neophyte_1', name: 'Neophyte', type: 'minion', power: 2, count: 4, ability: 'Reveal the top card of your deck. If it is an action, you may place it in your hand or play it as an extra action. Otherwise, return it to the top of your deck.', subtype: 'base', discard: 'no' },
@@ -142,6 +141,118 @@ const factionsData = {
   }
 };
 
+// Declarative rules data. `ability` above remains the player-facing card text;
+// these definitions are the server-facing source for a future rules resolver.
+const ability = (trigger, effects, options = {}) => ({
+  trigger,
+  effects: Array.isArray(effects) ? effects : [effects],
+  ...options
+});
+
+const abilityDefinitions = {
+  // Dinosaurs
+  dino_war_raptor_1: [ability('ongoing', { type: 'modifyPower', target: 'self', amount: { type: 'countMinions', cardId: 'dino_war_raptor_1', location: 'sameBase', excludeSelf: true }, duration: 'whileInPlay' })],
+  dino_bro_1: [ability('ongoing', { type: 'destroyMinion', target: { kind: 'minion', location: 'sameBase', printedPower: { max: 2 } } }, { optional: true })],
+  dino_king_1: [],
+  dino_armor_1: [ability('talent', { type: 'modifyPower', target: 'self', amount: 2, duration: 'untilStartOfOwnersNextTurn' })],
+  dino_howl_1: [ability('onPlay', { type: 'modifyPower', target: { kind: 'minion', owner: 'controller', location: 'selectedBase' }, amount: 1, duration: 'untilEndOfTurn' })],
+  dino_augmentation_1: [ability('onPlay', { type: 'modifyPower', target: 'selectedMinion', amount: 4, duration: 'untilEndOfTurn' })],
+  dino_tooth_1: [ability('ongoing', { type: 'grantProtection', target: 'attachedTo', protection: { from: 'otherPlayersCards' }, duration: 'whileAttached' })],
+  dino_upgrade_1: [ability('ongoing', { type: 'modifyPower', target: 'attachedTo', amount: 2, duration: 'whileAttached' })],
+  dino_wildlife_preserve_1: [ability('ongoing', { type: 'grantProtection', target: { kind: 'minion', owner: 'controller', location: 'attachedBase' }, protection: { from: 'otherPlayersActions' }, duration: 'whileAttached' })],
+  dino_natural_selection_1: [ability('onPlay', { type: 'destroyMinion', target: { kind: 'minion', location: 'sameBaseAsSelectedMinion', power: { lessThan: 'selectedMinion' } } })],
+  dino_rampage_1: [ability('onPlay', { type: 'modifyBreakpoint', target: 'baseOfSelectedMinion', amount: { type: 'negativePowerOf', target: 'selectedMinion' }, duration: 'untilEndOfTurn' })],
+  dino_survival_1: [ability('onPlay', { type: 'destroyLowestPowerMinion', target: { kind: 'base', filter: 'hasHigherPowerMinion' }, tieBreaker: 'controllerChooses' })],
+
+  // Aliens
+  alien_supreme_overlord_1: [ability('onPlay', { type: 'returnToHand', target: { kind: 'minion', owner: 'any' } }, { optional: true })],
+  alien_invader_1: [ability('onPlay', { type: 'gainVictoryPoints', target: 'controller', amount: 1 })],
+  alien_scout_1: [ability('afterBaseScoring', { type: 'returnToHand', target: 'self' }, { optional: true })],
+  alien_collector_1: [ability('onPlay', { type: 'returnToHand', target: { kind: 'minion', location: 'sameBase', power: { max: 3 } } }, { optional: true })],
+  alien_abduction_1: [ability('onPlay', [{ type: 'returnToHand', target: 'selectedMinion' }, { type: 'grantExtraPlay', cardType: 'minion', amount: 1, duration: 'thisTurn' }])],
+  alien_beam_up_1: [ability('onPlay', { type: 'returnToHand', target: 'selectedMinion' })],
+  alien_crop_circles_1: [ability('onPlay', { type: 'returnToHand', target: { kind: 'minion', location: 'selectedBase', owner: 'any', quantity: 'all' } })],
+  alien_disintegrator_1: [ability('onPlay', { type: 'moveToDeck', target: { kind: 'minion', power: { max: 3 } }, position: 'bottom' })],
+  alien_invasion_1: [ability('onPlay', { type: 'moveMinion', target: 'selectedMinion', destination: { kind: 'base', relation: 'another' } })],
+  alien_jammed_signal_1: [ability('ongoing', { type: 'cancelBaseAbilities', target: 'attachedBase', duration: 'whileAttached' })],
+  alien_probe_1: [ability('onPlay', [{ type: 'revealHand', target: { kind: 'player', relation: 'other' } }, { type: 'discardFromHand', target: { kind: 'minion', owner: 'selectedPlayer' } }])],
+  alien_terraforming_1: [ability('onPlay', [{ type: 'swapBaseFromDeck', target: 'selectedBase' }, { type: 'grantExtraPlay', cardType: 'minion', amount: 1, destination: 'replacementBase', duration: 'thisTurn' }])],
+
+  // Ninjas
+  ninja_master_1: [ability('onPlay', { type: 'destroyMinion', target: { kind: 'minion', location: 'sameBase' } }, { optional: true })],
+  ninja_tiger_assassin_1: [ability('onPlay', { type: 'destroyMinion', target: { kind: 'minion', location: 'sameBase', power: { max: 3 } } }, { optional: true })],
+  ninja_shinobi_1: [ability('beforeBaseScoring', { type: 'playFromHand', card: 'self', destination: 'scoringBase' }, { optional: true, limit: { scope: 'base', key: 'ninja_shinobi', maxUses: 1 } })],
+  ninja_acolyte_1: [ability('talent', [{ type: 'returnToHand', target: 'self' }, { type: 'grantExtraPlay', cardType: 'minion', amount: 1, destination: 'sameBase' }], { condition: { turnState: { minionPlayed: false } } })],
+  ninja_assassination_1: [ability('endTurn', { type: 'destroyMinion', target: 'attachedTo' })],
+  ninja_disguise_1: [ability('onPlay', [{ type: 'grantExtraPlay', cardType: 'minion', amount: { type: 'selectedCount' }, destination: 'selectedBase' }, { type: 'returnToHand', target: { kind: 'minion', owner: 'controller', selected: true, quantity: { min: 1, max: 2 } } }])],
+  ninja_hidden_ninja_1: [ability('beforeBaseScoring', { type: 'playMinionFromHand', destination: 'scoringBase' }, { optional: true })],
+  ninja_infiltrate_1: [ability('onPlay', { type: 'destroyAction', target: { kind: 'action', location: 'attachedBase', exclude: 'self' } }, { optional: true }), ability('talent', [{ type: 'destroyAction', target: 'self' }, { type: 'cancelBaseAbilities', target: 'attachedBase', duration: 'untilStartOfOwnersNextTurn' }])],
+  ninja_poison_1: [ability('onPlay', { type: 'destroyAction', target: { kind: 'action', location: 'attachedTo', quantity: 'any' } }, { optional: true }), ability('ongoing', { type: 'modifyPower', target: 'attachedTo', amount: -4, minimum: 0, duration: 'whileAttached' })],
+  ninja_seeing_stars_1: [ability('onPlay', { type: 'destroyMinion', target: { kind: 'minion', power: { max: 3 } } })],
+  ninja_smoke_bomb_1: [ability('ongoing', { type: 'grantProtection', target: 'attachedTo', protection: { from: 'otherPlayersActions' }, duration: 'whileAttached' })],
+  ninja_way_of_deception_1: [ability('onPlay', { type: 'moveMinion', target: 'selectedMinion', destination: { kind: 'base', relation: 'another' } })],
+
+  // Pirates
+  pirate_king_1: [ability('beforeBaseScoring', { type: 'moveMinion', target: 'self', destination: 'scoringBase' }, { optional: true })],
+  pirate_buccaneer_1: [ability('wouldBeDestroyed', { type: 'moveMinion', target: 'self', destination: { kind: 'base', relation: 'another' }, replacementFor: 'destroy' }, { optional: true, limit: { scope: 'turn', maxUses: 1 } })],
+  pirate_cut_lass_1: [ability('onPlay', { type: 'destroyMinion', target: { kind: 'minion', location: 'sameBase', power: { max: 2 } } }, { optional: true })],
+  pirate_first_mate_1: [ability('afterBaseScoring', { type: 'moveMinion', target: 'self', destination: { kind: 'base', relation: 'another' }, replacementFor: 'discard' }, { optional: true })],
+  pirate_broadside_1: [ability('onPlay', { type: 'destroyMinion', target: { kind: 'minion', owner: 'selectedPlayer', location: 'selectedBase', power: { max: 2 }, quantity: 'all' }, condition: { controllerHasMinionAt: 'selectedBase' } })],
+  pirate_cannon_1: [ability('onPlay', { type: 'destroyMinion', target: { kind: 'minion', power: { max: 2 }, quantity: { max: 2 } } })],
+  pirate_dinghy_1: [ability('onPlay', { type: 'moveMinion', target: { kind: 'minion', owner: 'controller', quantity: { max: 2 } }, destination: { kind: 'base', relation: 'another', perTarget: true } })],
+  pirate_full_sail_1: [ability('beforeBaseScoring', { type: 'moveMinion', target: { kind: 'minion', owner: 'controller', quantity: 'any' }, destination: { kind: 'base', relation: 'another', perTarget: true } }, { optional: true })],
+  pirate_powderkeg_1: [ability('onPlay', { type: 'destroyMinion', target: { kind: 'minion', location: 'sameBaseAsSelectedMinion', power: { max: 'selectedMinion' }, quantity: 'all', include: 'selectedMinion' } })],
+  pirate_sea_dogs_1: [ability('onPlay', { type: 'moveMinion', target: { kind: 'minion', owner: 'otherPlayers', faction: 'namedFaction', location: 'selectedBase', quantity: 'all' }, destination: { kind: 'base', relation: 'another' } })],
+  pirate_shanghai_1: [ability('onPlay', { type: 'moveMinion', target: { kind: 'minion', owner: 'otherPlayer' }, destination: { kind: 'base', relation: 'another' } })],
+  pirate_swashbuckling_1: [ability('onPlay', { type: 'modifyPower', target: { kind: 'minion', owner: 'controller', quantity: 'all' }, amount: 1, duration: 'untilEndOfTurn' })],
+
+  // Robots
+  robot_nukebot_1: [ability('afterDestroyed', { type: 'destroyMinion', target: { kind: 'minion', owner: 'otherPlayers', location: 'formerBase', quantity: 'all' } })],
+  robot_warbot_1: [ability('ongoing', { type: 'grantProtection', target: 'self', protection: { from: 'destroy' }, duration: 'whileInPlay' })],
+  robot_hoverbot_1: [ability('onPlay', { type: 'revealTopDeckCard', target: 'controller', resolve: { if: { cardType: 'minion' }, then: { type: 'playRevealedCard', cardType: 'minion', extra: true }, otherwise: { type: 'returnRevealedCardToDeckTop' } } }, { optional: true })],
+  robot_zapbot_1: [ability('onPlay', { type: 'grantExtraPlay', cardType: 'minion', maxPower: 2, amount: 1, duration: 'thisTurn' }, { optional: true })],
+  robot_microbot_alpha_1: [ability('ongoing', [{ type: 'addTrait', target: { kind: 'minion', owner: 'controller', quantity: 'all' }, trait: 'Microbot', duration: 'whileInPlay' }, { type: 'modifyPower', target: 'self', amount: { type: 'countMinionsWithTrait', trait: 'Microbot', owner: 'controller', excludeSelf: true }, duration: 'whileInPlay' }])],
+  robot_microbot_archive_1: [ability('afterDestroyed', { type: 'drawCards', target: 'controller', amount: 1 }, { condition: { destroyedCard: { trait: 'Microbot', includeSelf: true } }, optional: true })],
+  robot_microbot_fixer_1: [ability('onPlay', { type: 'grantExtraPlay', cardType: 'minion', amount: 1, duration: 'thisTurn' }, { optional: true, condition: { turnState: { minionsPlayed: 1 } } }), ability('ongoing', { type: 'modifyPower', target: { kind: 'minion', owner: 'controller', trait: 'Microbot', quantity: 'all' }, amount: 1, duration: 'whileInPlay' })],
+  robot_microbot_guard_1: [ability('onPlay', { type: 'destroyMinion', target: { kind: 'minion', location: 'sameBase', power: { lessThan: { type: 'countMinions', owner: 'controller', location: 'sameBase' } } } })],
+  robot_microbot_reclaimer_1: [ability('onPlay', [{ type: 'grantExtraPlay', cardType: 'minion', amount: 1, duration: 'thisTurn' }, { type: 'shuffleDiscardIntoDeck', target: { kind: 'card', owner: 'controller', trait: 'Microbot', quantity: 'any' } }], { optional: true, condition: { turnState: { minionsPlayed: 1 } } })],
+  robot_tech_center_1: [ability('onPlay', { type: 'drawCards', target: 'controller', amount: { type: 'countMinions', owner: 'controller', location: 'selectedBase' } })],
+
+  // Wizards
+  wizard_archmage_1: [ability('ongoing', { type: 'grantExtraPlay', cardType: 'action', amount: 1, duration: 'eachOwnersTurn' })],
+  wizard_chronomage_1: [ability('onPlay', { type: 'grantExtraPlay', cardType: 'action', amount: 1, duration: 'thisTurn' }, { optional: true })],
+  wizard_enchantress_1: [ability('onPlay', { type: 'drawCards', target: 'controller', amount: 1 })],
+  wizard_neophyte_1: [ability('onPlay', { type: 'revealTopDeckCard', target: 'controller', resolve: { if: { cardType: 'action' }, then: { type: 'choose', options: [{ type: 'moveRevealedCardToHand' }, { type: 'playRevealedCard', cardType: 'action', extra: true }] }, otherwise: { type: 'returnRevealedCardToDeckTop' } } }, { optional: true })],
+  wizard_mass_enchantment_1: [ability('onPlay', { type: 'revealTopDeckCard', target: { kind: 'player', relation: 'other', quantity: 'all' }, resolve: { type: 'playOneRevealedCard', cardType: 'action', extra: true, returnUnusedToTop: true } })],
+  wizard_mystic_studies_1: [ability('onPlay', { type: 'drawCards', target: 'controller', amount: 2 })],
+  wizard_portal_1: [ability('onPlay', { type: 'revealDeckCards', target: 'controller', amount: 5, resolve: { type: 'moveSelectedRevealedCardsToHand', cardType: 'minion', returnUnselectedToTopInOrder: true } })],
+  wizard_sacrifice_1: [ability('onPlay', [{ type: 'drawCards', target: 'controller', amount: { type: 'powerOf', target: 'selectedMinion' } }, { type: 'destroyMinion', target: 'selectedMinion' }])],
+  wizard_scry_1: [ability('onPlay', { type: 'searchDeck', target: 'controller', cardType: 'action', resolve: { type: 'revealSelectedCard', then: { type: 'moveSelectedCardToHand' }, shuffleAfter: true } })],
+  wizard_summon_1: [ability('onPlay', { type: 'grantExtraPlay', cardType: 'minion', amount: 1, duration: 'thisTurn' })],
+  wizard_time_loop_1: [ability('onPlay', { type: 'grantExtraPlay', cardType: 'action', amount: 2, duration: 'thisTurn' })],
+  wizard_winds_of_change_1: [ability('onPlay', [{ type: 'shuffleHandIntoDeck', target: 'controller' }, { type: 'drawCards', target: 'controller', amount: 5 }, { type: 'grantExtraPlay', cardType: 'action', amount: 1, duration: 'thisTurn' }])],
+
+  // Zombies
+  zombie_lord_1: [ability('onPlay', { type: 'playFromDiscard', cardType: 'minion', maxPower: 2, destination: { kind: 'base', filter: 'controllerHasNoMinions', quantity: 'each' }, extra: true }, { optional: true })],
+  zombie_grave_digger_1: [ability('onPlay', { type: 'moveFromDiscardToHand', target: { kind: 'minion', owner: 'controller' } }, { optional: true })],
+  zombie_tenacious_z_1: [ability('duringTurn', { type: 'playFromDiscard', card: 'self', cardType: 'minion', extra: true }, { optional: true, limit: { scope: 'turn', key: 'tenacious-z', maxUses: 1 } })],
+  zombie_walker_1: [ability('onPlay', { type: 'revealTopDeckCard', target: 'controller', resolve: { type: 'choose', options: [{ type: 'discardRevealedCard' }, { type: 'returnRevealedCardToDeckTop' }] } }, { optional: true })],
+  zombie_grave_robbing_1: [ability('onPlay', { type: 'moveFromDiscardToHand', target: { kind: 'card', owner: 'controller' } })],
+  zombie_lend_a_hand_1: [ability('onPlay', { type: 'shuffleDiscardIntoDeck', target: { kind: 'card', owner: 'controller', quantity: 'any' } })],
+  zombie_mall_crawl_1: [ability('onPlay', { type: 'searchDeck', target: 'controller', resolve: { type: 'moveCardsWithSelectedNameToDiscard', quantity: 'any', shuffleAfter: true } })],
+  zombie_not_enough_bullets_1: [ability('onPlay', { type: 'moveFromDiscardToHand', target: { kind: 'minion', owner: 'controller', sameNameAs: 'selectedCard', quantity: 'any' } })],
+  zombie_outbreak_1: [ability('onPlay', { type: 'grantExtraPlay', cardType: 'minion', amount: 1, destination: { kind: 'base', filter: 'controllerHasNoMinions' }, duration: 'thisTurn' })],
+  zombie_overrun_1: [ability('ongoing', { type: 'preventPlay', target: { kind: 'minion', owner: 'otherPlayers', location: 'attachedBase' }, duration: 'whileAttached' }), ability('startTurn', { type: 'destroyAction', target: 'self' })],
+  zombie_they_keep_coming_1: [ability('onPlay', { type: 'grantExtraPlayFromDiscard', cardType: 'minion', amount: 1, duration: 'thisTurn' })],
+  zombie_they_re_coming_to_get_you_1: [ability('talent', { type: 'playFromDiscard', cardType: 'minion', destination: 'attachedBase', replacementFor: 'playFromHand' }, { optional: true, limit: { scope: 'turn', maxUses: 1 } })]
+};
+
+for (const faction of Object.values(factionsData)) {
+  for (const card of faction.cards) {
+    card.abilities = abilityDefinitions[card.id] ?? [];
+  }
+}
+
 function buildFactionDeck(factionKey) {
   const faction = factionsData[factionKey];
   if (!faction) return [];
@@ -151,11 +262,13 @@ function buildFactionDeck(factionKey) {
     for (let i = 0; i < cardTemplate.count; i++) {
       deck.push({
         instanceId: `${cardTemplate.id}_${Math.random().toString(36).substr(2, 5)}`,
+        cardId: cardTemplate.id,
         name: cardTemplate.name,
         type: cardTemplate.type,
         subtype: cardTemplate.subtype,
         power: cardTemplate.power,
         ability: cardTemplate.ability,
+        abilities: cardTemplate.abilities,
         faction: faction.name,
         discard: cardTemplate.discard
       });

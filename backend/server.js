@@ -163,6 +163,7 @@ io.on('connection', (socket) => {
 
         // Route card based on discard flag and subtype destination & Build Battle Log Entry
         let logMessage = '';
+        let targetName = null;
 
         if (card.discard === 'yes' && card.subtype === 'neither') {
             // Standard action with no target that discards immediately
@@ -175,12 +176,14 @@ io.on('connection', (socket) => {
                 const base = room.activeBases[baseIndex];
                 if (!base.playedCards) base.playedCards = [];
                 base.playedCards.push(playedCard);
-                logMessage = `**${player.name}** plays **${card.name}** on **Base ${baseIndex + 1}**`;
+                targetName = base.name;
+                logMessage = `**${player.name}** plays **${card.name}** on **${base.name}**`;
             } else if (card.subtype === 'ally-minion' || card.subtype === 'enemy-minion' || card.subtype === 'neutral-minion') {
                 if (!targetMinion.attachedCards) {
                     targetMinion.attachedCards = [];
                 }
                 targetMinion.attachedCards.push(playedCard);
+                targetName = targetMinion.name;
                 logMessage = `**${player.name}** plays **${card.name}** on **${targetMinion ? targetMinion.name : 'Target Minion'}**`;
             } else {
                 // Fallback for any other 'yes' discard action
@@ -199,7 +202,13 @@ io.on('connection', (socket) => {
 
         // Initialize battleLog if missing and push new entry
         if (!room.battleLog) room.battleLog = [];
-        room.battleLog.unshift(logMessage); // Newest entries at the top
+        room.battleLog.unshift({
+            message: logMessage,
+            card: playedCard,
+            playerName: player.name,
+            targetName,
+            targetCard: targetMinion
+        }); // Newest entries at the top
 
         // Broadcast updated game state
         io.to(roomId).emit('game-state-update', {
@@ -270,6 +279,11 @@ io.on('connection', (socket) => {
                 room.battleLog.unshift(`**${base.name}** is scoring!`);
             });
 
+            const activePlayer = room.players.find(p => p.id === room.currentTurnPlayerId);
+            if (activePlayer) {
+                room.battleLog.unshift(`**${activePlayer.name}** has ended their turn`);
+            }
+
             room.gamePhase = 'scoring';
 
             io.to(roomId).emit('game-state-update', {
@@ -300,14 +314,6 @@ io.on('connection', (socket) => {
                 }
 
                 const currentPlayerIndex = room.players.findIndex(p => p.id === socket.id);
-                const activePlayer = room.players.find(p => p.id === room.currentTurnPlayerId);
-
-                // 🏆 END TURN LOG ENTRY
-                if (activePlayer) {
-                    if (!room.battleLog) room.battleLog = [];
-                    room.battleLog.unshift(`**${activePlayer.name}** has ended their turn`);
-                }
-
                 // 🧹 Run cleanup sweep here too!
                 cleanupDelayedDiscardCards();
 
