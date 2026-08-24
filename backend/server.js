@@ -7,6 +7,8 @@ const { getTriggeredEffects } = require('./abilityQueue.js');
 
 const PORT = 3000;
 const SOCKET_CORS_OPTIONS = { origin: '*' };
+const MAX_CHAT_HISTORY = 100;
+const MAX_CHAT_MESSAGE_LENGTH = 500;
 const createInitialTurnState = () => ({
     actionPlayed: false,
     minionPlayed: false,
@@ -40,11 +42,13 @@ io.on('connection', (socket) => {
             players: [{ id: socket.id, name: playerName, hand: [], deck: [], discardPile: [], online: true }],
             gamePhase: 'lobby',
             pendingAbility: null,
-            temporaryEffects: []
+            temporaryEffects: [],
+            chatMessages: []
         };
 
         socket.join(roomId);
         socket.emit('room-created', { roomId, players: rooms[roomId].players, host: rooms[roomId].host });
+        socket.emit('chat-history', { messages: [] });
     });
     socket.on('join-room', ({ roomId, playerName }) => {
         const formattedRoomId = roomId.trim().toUpperCase();
@@ -66,6 +70,7 @@ io.on('connection', (socket) => {
                 existingPlayer.id = socket.id;
                 existingPlayer.online = true;
                 socket.join(formattedRoomId);
+                socket.emit('chat-history', { messages: room.chatMessages || [] });
 
                 if (room.gamePhase === 'drafting') {
                     socket.emit('draft-started', { draftState: sanitizeDraftState(room.draftState), players: room.players, spectators: room.spectators || [] });
@@ -80,6 +85,7 @@ io.on('connection', (socket) => {
             // 2. If the game has already started and they are NOT an active player -> Spectator
             if (room.gamePhase && room.gamePhase !== 'lobby') {
                 socket.join(formattedRoomId);
+                socket.emit('chat-history', { messages: room.chatMessages || [] });
 
                 if (!room.spectators) room.spectators = [];
                 room.spectators.push({ id: socket.id, name: exactName });
@@ -97,6 +103,7 @@ io.on('connection', (socket) => {
 
             // 3. Standard Lobby Join (Game hasn't started yet)
             socket.join(formattedRoomId);
+            socket.emit('chat-history', { messages: room.chatMessages || [] });
             const newPlayer = { id: socket.id, name: exactName, hand: [], deck: [], discardPile: [], online: true };
             room.players.push(newPlayer);
 
@@ -107,6 +114,18 @@ io.on('connection', (socket) => {
             socket.emit('error', 'Room not found! Check your code.');
         }
     });
+
+    socket.on('send-chat-message', ({ roomId, message }) => {
+        const room = rooms[roomId];
+        if (!room || !socket.rooms.has(roomId)) return;
+        const sender = room.players.find(player => player.id === socket.id);
+        if (!sender) return socket.emit('error', 'Only players in this room can send chat messages.');
+
+        const result = appendChatMessage(room, sender, message);
+        if (!result.ok) return socket.emit('error', result.error);
+        io.to(roomId).emit('chat-message', result.message);
+    });
+
     socket.on('play-card', ({ roomId, cardInstanceId, baseIndex, targetMinionInstanceId, fromDiscard = false }) => {
         const room = rooms[roomId];
         if (!room || room.gamePhase !== 'playing') return;
@@ -3059,6 +3078,31 @@ function addBattleLog(room, message) {
     room.battleLog.unshift(message);
 }
 
+function appendChatMessage(room, sender, rawMessage) {
+    if (typeof rawMessage !== 'string') {
+        return { ok: false, error: 'Chat message must be text.' };
+    }
+    const text = rawMessage.trim();
+    if (!text) return { ok: false, error: 'Chat message cannot be empty.' };
+    if (text.length > MAX_CHAT_MESSAGE_LENGTH) {
+        return { ok: false, error: `Chat messages must be ${MAX_CHAT_MESSAGE_LENGTH} characters or fewer.` };
+    }
+
+    const message = {
+        id: `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
+        senderId: sender.id,
+        senderName: sender.name,
+        text,
+        timestamp: Date.now()
+    };
+    if (!room.chatMessages) room.chatMessages = [];
+    room.chatMessages.push(message);
+    if (room.chatMessages.length > MAX_CHAT_HISTORY) {
+        room.chatMessages.splice(0, room.chatMessages.length - MAX_CHAT_HISTORY);
+    }
+    return { ok: true, message };
+}
+
 function resolveStartTurnActions(room, playerId) {
     clearStartTurnEffects(room, playerId);
     activateNextTurnEffects(room);
@@ -4129,6 +4173,7 @@ if (require.main === module) {
 
 module.exports = {
     activateTalent,
+    appendChatMessage,
     baseAbilitiesAreCancelled,
     clearTemporaryEffects,
     createInitialTurnState,

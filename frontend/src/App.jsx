@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { io } from 'socket.io-client';
 
 const SOCKET_URL = 'http://localhost:3000';
@@ -91,6 +91,7 @@ function App() {
   const [currentTurnPlayerId, setCurrentTurnPlayerId] = useState(null);
   const [turnState, setTurnState] = useState(DEFAULT_TURN_STATE);
   const [battleLog, setBattleLog] = useState([]);
+  const [chatMessages, setChatMessages] = useState([]);
   const [myHand, setMyHand] = useState([]);
   const [myDiscard, setMyDiscard] = useState([]);
 
@@ -102,6 +103,8 @@ function App() {
   const [showDiscardModal, setShowDiscardModal] = useState(false);
   const [abilityChoice, setAbilityChoice] = useState(null);
   const [selectedAbilityChoiceIds, setSelectedAbilityChoiceIds] = useState([]);
+  const [chatDraft, setChatDraft] = useState('');
+  const chatScrollRef = useRef(null);
 
   useEffect(() => {
     socket.on('room-created', ({ roomId, players, host }) => {
@@ -181,6 +184,18 @@ function App() {
       setSelectedAbilityChoiceIds([]);
     });
 
+    socket.on('chat-history', ({ messages }) => {
+      setChatMessages(Array.isArray(messages) ? messages : []);
+    });
+
+    socket.on('chat-message', (message) => {
+      setChatMessages(current => (
+        current.some(existing => existing.id === message.id)
+          ? current
+          : [...current, message]
+      ));
+    });
+
     socket.on('room-reset', ({ message }) => {
       if (message) {
         alert(message);
@@ -202,10 +217,17 @@ function App() {
       socket.off('game-started');
       socket.off('game-state-update');
       socket.off('ability-choice-required');
+      socket.off('chat-history');
+      socket.off('chat-message');
       socket.off('room-reset');
       socket.off('error');
     };
   }, []);
+
+  useEffect(() => {
+    const chatElement = chatScrollRef.current;
+    if (chatElement) chatElement.scrollTop = chatElement.scrollHeight;
+  }, [chatMessages, gamePhase]);
 
   const resetAppToLobby = () => {
     setCurrentRoom(null);
@@ -221,6 +243,8 @@ function App() {
     setCurrentTurnPlayerId(null);
     setTurnState(DEFAULT_TURN_STATE);
     setBattleLog([]);
+    setChatMessages([]);
+    setChatDraft('');
     setSelectedCardDetail(null);
     setSelectedCardToPlay(null);
     setSelectedCardSource('hand');
@@ -281,6 +305,14 @@ function App() {
 
   const handleEndTurn = () => {
     socket.emit('end-turn', { roomId: currentRoom });
+  };
+
+  const handleSendChatMessage = (event) => {
+    event.preventDefault();
+    const message = chatDraft.trim();
+    if (!message || !currentRoom) return;
+    socket.emit('send-chat-message', { roomId: currentRoom, message });
+    setChatDraft('');
   };
 
   const handleLeaveRoom = () => {
@@ -677,6 +709,86 @@ function App() {
                     </ul>
                   )}
                 </div>
+              </div>
+
+              {/* Player chat */}
+              <div style={{ borderTop: '1px solid #ddd', paddingTop: '10px' }}>
+                <h3 style={{ margin: '0 0 8px 0', fontSize: '15px' }}>Player Chat</h3>
+                <div
+                  ref={chatScrollRef}
+                  style={{
+                    border: '1px solid #ccc',
+                    borderRadius: '6px',
+                    padding: '10px',
+                    backgroundColor: '#fff',
+                    height: '180px',
+                    overflowY: 'auto'
+                  }}
+                >
+                  {chatMessages.length === 0 ? (
+                    <p style={{ fontSize: '11px', color: '#777', fontStyle: 'italic', margin: 0 }}>
+                      No messages yet.
+                    </p>
+                  ) : (
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                      {chatMessages.map(message => (
+                        <div key={message.id} style={{ fontSize: '11px', lineHeight: '1.35' }}>
+                          <div>
+                            <strong style={{ color: message.senderId === socket.id ? '#007bff' : '#333' }}>
+                              {message.senderName}
+                            </strong>
+                            <span style={{ color: '#999', marginLeft: '6px', fontSize: '9px' }}>
+                              {new Date(message.timestamp).toLocaleTimeString([], {
+                                hour: '2-digit',
+                                minute: '2-digit'
+                              })}
+                            </span>
+                          </div>
+                          <div style={{ color: '#444', overflowWrap: 'anywhere', whiteSpace: 'pre-wrap' }}>
+                            {message.text}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+                <form
+                  onSubmit={handleSendChatMessage}
+                  style={{ display: 'flex', gap: '6px', marginTop: '8px' }}
+                >
+                  <input
+                    type="text"
+                    value={chatDraft}
+                    onChange={(event) => setChatDraft(event.target.value)}
+                    maxLength={500}
+                    placeholder="Message players..."
+                    aria-label="Chat message"
+                    style={{
+                      border: '1px solid #bbb',
+                      borderRadius: '4px',
+                      flex: 1,
+                      fontSize: '11px',
+                      minWidth: 0,
+                      padding: '7px'
+                    }}
+                  />
+                  <button
+                    type="submit"
+                    disabled={!chatDraft.trim()}
+                    style={{
+                      backgroundColor: chatDraft.trim() ? '#007bff' : '#aaa',
+                      border: 'none',
+                      borderRadius: '4px',
+                      color: 'white',
+                      cursor: chatDraft.trim() ? 'pointer' : 'not-allowed',
+                      fontSize: '11px',
+                      fontWeight: 'bold',
+                      padding: '7px 10px'
+                    }}
+                  >
+                    Send
+                  </button>
+                </form>
               </div>
             <button
               onClick={handleLeaveRoom}

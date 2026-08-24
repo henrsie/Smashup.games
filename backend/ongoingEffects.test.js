@@ -4,6 +4,7 @@ const { basesData } = require('./bases.js');
 const { factionsData } = require('./factions.js');
 const {
     activateTalent,
+    appendChatMessage,
     baseAbilitiesAreCancelled,
     createInitialTurnState,
     getOngoingDiscardPlayBaseIndices,
@@ -61,6 +62,24 @@ function createRoom(activeBases) {
         turnState: createInitialTurnState()
     };
 }
+
+test('room chat validates messages and retains the latest 100 entries', () => {
+    const room = createRoom([createBase('base_the_homeworld')]);
+    const sender = room.players[0];
+
+    const firstResult = appendChatMessage(room, sender, '  Hello everyone!  ');
+    assert.equal(firstResult.ok, true);
+    assert.equal(firstResult.message.text, 'Hello everyone!');
+    assert.equal(appendChatMessage(room, sender, '   ').ok, false);
+    assert.equal(appendChatMessage(room, sender, 'x'.repeat(501)).ok, false);
+
+    for (let index = 0; index < 105; index += 1) {
+        appendChatMessage(room, sender, `Message ${index}`);
+    }
+    assert.equal(room.chatMessages.length, 100);
+    assert.equal(room.chatMessages.at(-1).text, 'Message 104');
+    assert.equal(room.chatMessages[0].text, 'Message 5');
+});
 
 test('every declared continuous ongoing effect has a resolver archetype', () => {
     const supportedEffectTypes = new Set([
