@@ -1,7 +1,12 @@
 import { useEffect, useRef, useState } from 'react';
 import { io } from 'socket.io-client';
 
-const SOCKET_URL = 'http://localhost:3000';
+const SOCKET_URL =
+  import.meta.env.VITE_SOCKET_URL ||
+  (import.meta.env.DEV
+    ? 'http://localhost:3000'
+    : window.location.origin);
+
 const DEFAULT_TURN_STATE = {
   actionPlayed: false,
   minionPlayed: false,
@@ -641,155 +646,155 @@ function App() {
         <div style={{ display: 'flex', gap: '30px' }}>
           <div style={{ flex: '1', background: '#f4f4f4', padding: '15px', borderRadius: '8px', minWidth: '240px', display: 'flex', flexDirection: 'column', gap: '20px' }}>
 
-              {/* Players List */}
-              <div>
-                <h3>Players in Game:</h3>
-                <ul style={{ paddingLeft: '20px', margin: 0 }}>
-                  {players.map((p, index) => {
-                    const isMe = p.id === socket.id;
-                    const discardCount = p.discardPile ? p.discardPile.length : 0;
-                    const playerVp = p.vp !== undefined ? p.vp : 0;
-                    return (
-                      <li key={index} style={{ marginBottom: '12px', borderBottom: '1px solid #ddd', paddingBottom: '8px' }}>
-                        <strong>{p.name}</strong> {isMe ? '(You)' : ''} {p.id === currentTurnPlayerId ? '⭐' : ''}
-                        <div style={{ fontSize: '13px', fontWeight: 'bold', color: '#d9534f', margin: '2px 0' }}>
-                          🏆 Victory Points (VP): {playerVp}
-                        </div>
-                        <div style={{ fontSize: '12px', color: '#444' }}>
-                          Factions: {p.factions ? p.factions.join(' & ') : 'None'}
-                        </div>
-                        <div style={{ fontSize: '11px', color: '#666' }}>
-                          Deck: {p.deck ? p.deck.length : 0} | Hand: {p.hand ? p.hand.length : 0}
-                        </div>
-                        <div style={{ fontSize: '11px', color: '#c0392b', fontWeight: 'bold' }}>
-                          Discard Pile: {discardCount} {discardCount === 0 ? '(Empty)' : ''}
-                        </div>
-                      </li>
-                    );
-                  })}
-                </ul>
-              </div>
+            {/* Players List */}
+            <div>
+              <h3>Players in Game:</h3>
+              <ul style={{ paddingLeft: '20px', margin: 0 }}>
+                {players.map((p, index) => {
+                  const isMe = p.id === socket.id;
+                  const discardCount = p.discardPile ? p.discardPile.length : 0;
+                  const playerVp = p.vp !== undefined ? p.vp : 0;
+                  return (
+                    <li key={index} style={{ marginBottom: '12px', borderBottom: '1px solid #ddd', paddingBottom: '8px' }}>
+                      <strong>{p.name}</strong> {isMe ? '(You)' : ''} {p.id === currentTurnPlayerId ? '⭐' : ''}
+                      <div style={{ fontSize: '13px', fontWeight: 'bold', color: '#d9534f', margin: '2px 0' }}>
+                        🏆 Victory Points (VP): {playerVp}
+                      </div>
+                      <div style={{ fontSize: '12px', color: '#444' }}>
+                        Factions: {p.factions ? p.factions.join(' & ') : 'None'}
+                      </div>
+                      <div style={{ fontSize: '11px', color: '#666' }}>
+                        Deck: {p.deck ? p.deck.length : 0} | Hand: {p.hand ? p.hand.length : 0}
+                      </div>
+                      <div style={{ fontSize: '11px', color: '#c0392b', fontWeight: 'bold' }}>
+                        Discard Pile: {discardCount} {discardCount === 0 ? '(Empty)' : ''}
+                      </div>
+                    </li>
+                  );
+                })}
+              </ul>
+            </div>
 
-              {/* Spectators List */}
-              <div style={{ borderTop: '1px solid #ddd', paddingTop: '10px' }}>
-                <h3>Spectators ({spectators.length}):</h3>
-                {spectators.length === 0 ? (
-                  <p style={{ fontSize: '12px', color: '#777', fontStyle: 'italic' }}>No spectators watching</p>
+            {/* Spectators List */}
+            <div style={{ borderTop: '1px solid #ddd', paddingTop: '10px' }}>
+              <h3>Spectators ({spectators.length}):</h3>
+              {spectators.length === 0 ? (
+                <p style={{ fontSize: '12px', color: '#777', fontStyle: 'italic' }}>No spectators watching</p>
+              ) : (
+                <ul style={{ paddingLeft: '20px', margin: 0 }}>
+                  {spectators.map((s, index) => (
+                    <li key={index} style={{ fontSize: '13px', marginBottom: '5px' }}>
+                      👁️ {s.name} {s.id === socket.id ? '(You)' : ''}
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+
+            {/* Battle log */}
+            <div style={{ borderTop: '1px solid #ddd', paddingTop: '10px' }}>
+              <h3 style={{ margin: '0 0 8px 0', fontSize: '15px' }}>Battle Log</h3>
+              <div style={{
+                border: '1px solid #ccc',
+                borderRadius: '6px',
+                padding: '10px',
+                backgroundColor: '#fff',
+                maxHeight: '180px',
+                overflowY: 'auto'
+              }}>
+                {battleLog.length === 0 ? (
+                  <p style={{ fontSize: '11px', color: '#777', fontStyle: 'italic', margin: 0 }}>No actions played yet.</p>
                 ) : (
-                  <ul style={{ paddingLeft: '20px', margin: 0 }}>
-                    {spectators.map((s, index) => (
-                      <li key={index} style={{ fontSize: '13px', marginBottom: '5px' }}>
-                        👁️ {s.name} {s.id === socket.id ? '(You)' : ''}
+                  <ul style={{ paddingLeft: '15px', margin: 0, display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                    {battleLog.map((log, idx) => (
+                      <li key={idx} style={{ fontSize: '11px', lineHeight: '1.3', whiteSpace: 'pre-wrap' }}>
+                        <BattleLogEntry entry={log} onCardClick={setSelectedCardDetail} />
                       </li>
                     ))}
                   </ul>
                 )}
               </div>
+            </div>
 
-              {/* Battle log */}
-              <div style={{ borderTop: '1px solid #ddd', paddingTop: '10px' }}>
-                <h3 style={{ margin: '0 0 8px 0', fontSize: '15px' }}>Battle Log</h3>
-                <div style={{
+            {/* Player chat */}
+            <div style={{ borderTop: '1px solid #ddd', paddingTop: '10px' }}>
+              <h3 style={{ margin: '0 0 8px 0', fontSize: '15px' }}>Player Chat</h3>
+              <div
+                ref={chatScrollRef}
+                style={{
                   border: '1px solid #ccc',
                   borderRadius: '6px',
                   padding: '10px',
                   backgroundColor: '#fff',
-                  maxHeight: '180px',
+                  height: '180px',
                   overflowY: 'auto'
-                }}>
-                  {battleLog.length === 0 ? (
-                    <p style={{ fontSize: '11px', color: '#777', fontStyle: 'italic', margin: 0 }}>No actions played yet.</p>
-                  ) : (
-                    <ul style={{ paddingLeft: '15px', margin: 0, display: 'flex', flexDirection: 'column', gap: '6px' }}>
-                      {battleLog.map((log, idx) => (
-                        <li key={idx} style={{ fontSize: '11px', lineHeight: '1.3', whiteSpace: 'pre-wrap' }}>
-                          <BattleLogEntry entry={log} onCardClick={setSelectedCardDetail} />
-                        </li>
-                      ))}
-                    </ul>
-                  )}
-                </div>
+                }}
+              >
+                {chatMessages.length === 0 ? (
+                  <p style={{ fontSize: '11px', color: '#777', fontStyle: 'italic', margin: 0 }}>
+                    No messages yet.
+                  </p>
+                ) : (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                    {chatMessages.map(message => (
+                      <div key={message.id} style={{ fontSize: '11px', lineHeight: '1.35' }}>
+                        <div>
+                          <strong style={{ color: message.senderId === socket.id ? '#007bff' : '#333' }}>
+                            {message.senderName}
+                          </strong>
+                          <span style={{ color: '#999', marginLeft: '6px', fontSize: '9px' }}>
+                            {new Date(message.timestamp).toLocaleTimeString([], {
+                              hour: '2-digit',
+                              minute: '2-digit'
+                            })}
+                          </span>
+                        </div>
+                        <div style={{ color: '#444', overflowWrap: 'anywhere', whiteSpace: 'pre-wrap' }}>
+                          {message.text}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
-
-              {/* Player chat */}
-              <div style={{ borderTop: '1px solid #ddd', paddingTop: '10px' }}>
-                <h3 style={{ margin: '0 0 8px 0', fontSize: '15px' }}>Player Chat</h3>
-                <div
-                  ref={chatScrollRef}
+              <form
+                onSubmit={handleSendChatMessage}
+                style={{ display: 'flex', gap: '6px', marginTop: '8px' }}
+              >
+                <input
+                  type="text"
+                  value={chatDraft}
+                  onChange={(event) => setChatDraft(event.target.value)}
+                  maxLength={500}
+                  placeholder="Message players..."
+                  aria-label="Chat message"
                   style={{
-                    border: '1px solid #ccc',
-                    borderRadius: '6px',
-                    padding: '10px',
-                    backgroundColor: '#fff',
-                    height: '180px',
-                    overflowY: 'auto'
+                    border: '1px solid #bbb',
+                    borderRadius: '4px',
+                    flex: 1,
+                    fontSize: '11px',
+                    minWidth: 0,
+                    padding: '7px'
+                  }}
+                />
+                <button
+                  type="submit"
+                  disabled={!chatDraft.trim()}
+                  style={{
+                    backgroundColor: chatDraft.trim() ? '#007bff' : '#aaa',
+                    border: 'none',
+                    borderRadius: '4px',
+                    color: 'white',
+                    cursor: chatDraft.trim() ? 'pointer' : 'not-allowed',
+                    fontSize: '11px',
+                    fontWeight: 'bold',
+                    padding: '7px 10px'
                   }}
                 >
-                  {chatMessages.length === 0 ? (
-                    <p style={{ fontSize: '11px', color: '#777', fontStyle: 'italic', margin: 0 }}>
-                      No messages yet.
-                    </p>
-                  ) : (
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                      {chatMessages.map(message => (
-                        <div key={message.id} style={{ fontSize: '11px', lineHeight: '1.35' }}>
-                          <div>
-                            <strong style={{ color: message.senderId === socket.id ? '#007bff' : '#333' }}>
-                              {message.senderName}
-                            </strong>
-                            <span style={{ color: '#999', marginLeft: '6px', fontSize: '9px' }}>
-                              {new Date(message.timestamp).toLocaleTimeString([], {
-                                hour: '2-digit',
-                                minute: '2-digit'
-                              })}
-                            </span>
-                          </div>
-                          <div style={{ color: '#444', overflowWrap: 'anywhere', whiteSpace: 'pre-wrap' }}>
-                            {message.text}
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                </div>
-                <form
-                  onSubmit={handleSendChatMessage}
-                  style={{ display: 'flex', gap: '6px', marginTop: '8px' }}
-                >
-                  <input
-                    type="text"
-                    value={chatDraft}
-                    onChange={(event) => setChatDraft(event.target.value)}
-                    maxLength={500}
-                    placeholder="Message players..."
-                    aria-label="Chat message"
-                    style={{
-                      border: '1px solid #bbb',
-                      borderRadius: '4px',
-                      flex: 1,
-                      fontSize: '11px',
-                      minWidth: 0,
-                      padding: '7px'
-                    }}
-                  />
-                  <button
-                    type="submit"
-                    disabled={!chatDraft.trim()}
-                    style={{
-                      backgroundColor: chatDraft.trim() ? '#007bff' : '#aaa',
-                      border: 'none',
-                      borderRadius: '4px',
-                      color: 'white',
-                      cursor: chatDraft.trim() ? 'pointer' : 'not-allowed',
-                      fontSize: '11px',
-                      fontWeight: 'bold',
-                      padding: '7px 10px'
-                    }}
-                  >
-                    Send
-                  </button>
-                </form>
-              </div>
+                  Send
+                </button>
+              </form>
+            </div>
             <button
               onClick={handleLeaveRoom}
               style={{ marginTop: '20px', padding: '8px 12px', backgroundColor: '#d9534f', color: 'white', border: 'none', borderRadius: '4px', cursor: 'pointer' }}

@@ -4,10 +4,11 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "dev": "vite",
-    "start": "vite"
-  },
+  "test": "echo \"Error: no test specified\" && exit 1",
+  "dev": "vite",
+  "start": "vite",
+  "build": "vite build"
+},
   "keywords": [],
   "author": "",
   "license": "ISC",

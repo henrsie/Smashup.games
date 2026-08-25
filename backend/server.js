@@ -1,3 +1,4 @@
+const path = require('path');
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -5,8 +6,16 @@ const { buildBaseDeck } = require('./bases.js');
 const { factionsData, buildFactionDeck } = require('./factions.js');
 const { getTriggeredEffects } = require('./abilityQueue.js');
 
-const PORT = 3000;
-const SOCKET_CORS_OPTIONS = { origin: '*' };
+const PORT = Number.parseInt(process.env.PORT || '3000', 10);
+const allowedOrigins = (
+    process.env.CLIENT_ORIGIN || 'http://localhost:5173'
+)
+    .split(',')
+    .map(origin => origin.trim());
+
+const SOCKET_CORS_OPTIONS = {
+    origin: allowedOrigins
+};
 const MAX_CHAT_HISTORY = 100;
 const MAX_CHAT_MESSAGE_LENGTH = 500;
 const createInitialTurnState = () => ({
@@ -22,6 +31,21 @@ const createInitialTurnState = () => ({
 });
 
 const app = express();
+
+app.get('/health', (request, response) => {
+    response.status(200).json({ status: 'ok' });
+});
+
+if (process.env.NODE_ENV === 'production') {
+    const frontendDistPath = path.resolve(__dirname, '../frontend/dist');
+
+    app.use(express.static(frontendDistPath));
+
+    app.get(/^(?!\/socket\.io\/).*/, (request, response) => {
+        response.sendFile(path.join(frontendDistPath, 'index.html'));
+    });
+}
+
 const server = http.createServer(app);
 const io = new Server(server, {
     cors: SOCKET_CORS_OPTIONS
@@ -1033,89 +1057,89 @@ function resolveBoardEffect({ room, roomId, socket, effect, optional, sourceMini
     }
 
     switch (effect.type) {
-    case 'modifyPower':
-        if (effect.target === 'selectedMinion' && targetMinion) {
-            applyTemporaryPowerModifier(room, [targetMinion], effect.amount);
-        } else if (effect.target?.location === 'inPlay' && effect.target?.owner === 'controller') {
-            applyTemporaryPowerModifier(
-                room,
-                room.activeBases.flatMap(getBaseMinions).filter(minion => minion.ownerId === socket.id),
-                effect.amount
-            );
-        } else if (effect.target?.kind === 'minion') {
-            const targets = getEligibleMinions(room, socket.id, effect.target, targetBase, targetMinion);
-            applyTemporaryPowerModifier(room, targets, effect.amount);
+        case 'modifyPower':
+            if (effect.target === 'selectedMinion' && targetMinion) {
+                applyTemporaryPowerModifier(room, [targetMinion], effect.amount);
+            } else if (effect.target?.location === 'inPlay' && effect.target?.owner === 'controller') {
+                applyTemporaryPowerModifier(
+                    room,
+                    room.activeBases.flatMap(getBaseMinions).filter(minion => minion.ownerId === socket.id),
+                    effect.amount
+                );
+            } else if (effect.target?.kind === 'minion') {
+                const targets = getEligibleMinions(room, socket.id, effect.target, targetBase, targetMinion);
+                applyTemporaryPowerModifier(room, targets, effect.amount);
+            }
+            return false;
+        case 'modifyBreakpoint':
+            if (targetBase && targetMinion) {
+                applyTemporaryBreakpointModifier(room, targetBase, getCardPower(targetMinion));
+            }
+            return false;
+        case 'gainVictoryPoints': {
+            const player = room.players.find(candidate => candidate.id === socket.id);
+            if (player) player.vp += effect.amount;
+            return false;
         }
-        return false;
-    case 'modifyBreakpoint':
-        if (targetBase && targetMinion) {
-            applyTemporaryBreakpointModifier(room, targetBase, getCardPower(targetMinion));
-        }
-        return false;
-    case 'gainVictoryPoints': {
-        const player = room.players.find(candidate => candidate.id === socket.id);
-        if (player) player.vp += effect.amount;
-        return false;
-    }
-    case 'drawCards':
-        drawCards(room, socket.id, getEffectAmount(effect.amount, room, socket.id, targetBase, targetMinion));
-        return false;
-    case 'grantExtraPlay':
-        if (optional) {
-            queueConfirmation(socket, room, roomId, effect, `Use this ability to play ${formatExtraPlay(effect)}?`);
-            return true;
-        }
-        grantExtraPlay(room, effect, replacementBaseIndex);
-        return false;
-    case 'moveMinion':
-        if (effect.target?.faction === 'namedFaction') {
-            return queueSeaDogsFaction(room, roomId, socket, targetBase);
-        }
-        return beginMoveMinionEffect(room, roomId, socket, effect, targetMinion, targetBase);
-    case 'moveToDeck':
-        if (targetMinion && targetBase && getCardPower(targetMinion) <= effect.target?.power?.max) {
-            moveMinionToOwnersDeck(room, targetBase, targetMinion, effect.position);
-        }
-        return false;
-    case 'moveFromDiscardToHand':
-        return queueDiscardToHand(room, roomId, socket, effect, optional);
-    case 'revealTopDeckCard':
-        if (effect.target?.quantity === 'all') return queueMassEnchantment(room, roomId, socket);
-        return queueTopDeckReveal(room, roomId, socket, effect, optional);
-    case 'revealDeckCards':
-        return queueRevealedDeckSelection(room, roomId, socket, effect);
-    case 'searchDeck':
-        if (effect.resolve?.type === 'moveCardsWithSelectedNameToDiscard') {
-            return queueDeckNameSelection(room, roomId, socket);
-        }
-        return queueDeckSearch(room, roomId, socket, effect);
-    case 'shuffleDiscardIntoDeck':
-        return queueDiscardShuffle(room, roomId, socket, effect);
-    case 'shuffleHandIntoDeck':
-        shuffleHandIntoDeck(room, socket.id);
-        return false;
-    case 'playFromDiscard':
-    case 'grantExtraPlayFromDiscard':
-        return queueDiscardPlay(room, roomId, socket, effect, optional);
-    case 'revealHand':
-        return queuePlayerHandReveal(room, roomId, socket);
-    case 'discardFromHand':
-        return queueHandDiscard(room, roomId, socket, selectedPlayerId, effect);
-    case 'swapBaseFromDeck':
-        return queueBaseDeckSwap(room, roomId, socket, targetBase);
-    case 'destroyAction':
-        return queueAttachedActionDestruction(room, roomId, socket, targetMinion, sourceCardInstanceId);
-    case 'destroyLowestPowerMinion':
-        beginSurvivalOfTheFittest(room, roomId, socket);
-        return Boolean(room.pendingAbility);
-    case 'destroyMinion':
-    case 'returnToHand':
-        if (effect.target?.owner === 'selectedPlayer' && effect.target?.quantity === 'all') {
-            return queueSelectedPlayerBoardEffect(room, roomId, socket, effect, targetBase);
-        }
-        return resolveMinionBoardEffect({ room, roomId, socket, effect, optional, sourceMinionInstanceId, targetBase, targetMinion });
-    default:
-        return 'unsupported';
+        case 'drawCards':
+            drawCards(room, socket.id, getEffectAmount(effect.amount, room, socket.id, targetBase, targetMinion));
+            return false;
+        case 'grantExtraPlay':
+            if (optional) {
+                queueConfirmation(socket, room, roomId, effect, `Use this ability to play ${formatExtraPlay(effect)}?`);
+                return true;
+            }
+            grantExtraPlay(room, effect, replacementBaseIndex);
+            return false;
+        case 'moveMinion':
+            if (effect.target?.faction === 'namedFaction') {
+                return queueSeaDogsFaction(room, roomId, socket, targetBase);
+            }
+            return beginMoveMinionEffect(room, roomId, socket, effect, targetMinion, targetBase);
+        case 'moveToDeck':
+            if (targetMinion && targetBase && getCardPower(targetMinion) <= effect.target?.power?.max) {
+                moveMinionToOwnersDeck(room, targetBase, targetMinion, effect.position);
+            }
+            return false;
+        case 'moveFromDiscardToHand':
+            return queueDiscardToHand(room, roomId, socket, effect, optional);
+        case 'revealTopDeckCard':
+            if (effect.target?.quantity === 'all') return queueMassEnchantment(room, roomId, socket);
+            return queueTopDeckReveal(room, roomId, socket, effect, optional);
+        case 'revealDeckCards':
+            return queueRevealedDeckSelection(room, roomId, socket, effect);
+        case 'searchDeck':
+            if (effect.resolve?.type === 'moveCardsWithSelectedNameToDiscard') {
+                return queueDeckNameSelection(room, roomId, socket);
+            }
+            return queueDeckSearch(room, roomId, socket, effect);
+        case 'shuffleDiscardIntoDeck':
+            return queueDiscardShuffle(room, roomId, socket, effect);
+        case 'shuffleHandIntoDeck':
+            shuffleHandIntoDeck(room, socket.id);
+            return false;
+        case 'playFromDiscard':
+        case 'grantExtraPlayFromDiscard':
+            return queueDiscardPlay(room, roomId, socket, effect, optional);
+        case 'revealHand':
+            return queuePlayerHandReveal(room, roomId, socket);
+        case 'discardFromHand':
+            return queueHandDiscard(room, roomId, socket, selectedPlayerId, effect);
+        case 'swapBaseFromDeck':
+            return queueBaseDeckSwap(room, roomId, socket, targetBase);
+        case 'destroyAction':
+            return queueAttachedActionDestruction(room, roomId, socket, targetMinion, sourceCardInstanceId);
+        case 'destroyLowestPowerMinion':
+            beginSurvivalOfTheFittest(room, roomId, socket);
+            return Boolean(room.pendingAbility);
+        case 'destroyMinion':
+        case 'returnToHand':
+            if (effect.target?.owner === 'selectedPlayer' && effect.target?.quantity === 'all') {
+                return queueSelectedPlayerBoardEffect(room, roomId, socket, effect, targetBase);
+            }
+            return resolveMinionBoardEffect({ room, roomId, socket, effect, optional, sourceMinionInstanceId, targetBase, targetMinion });
+        default:
+            return 'unsupported';
     }
 }
 
@@ -4166,9 +4190,26 @@ function handlePlayerKick(roomId, playerId) {
 }
 
 if (require.main === module) {
-    server.listen(PORT, () => {
+    server.listen(PORT, '0.0.0.0', () => {
         console.log(`Server running on port ${PORT}`);
     });
+
+    const shutDown = () => {
+        console.log('Server shutting down');
+
+        io.emit('server-restarting');
+
+        io.close(() => {
+            process.exit(0);
+        });
+
+        setTimeout(() => {
+            process.exit(1);
+        }, 25_000).unref();
+    };
+
+    process.once('SIGTERM', shutDown);
+    process.once('SIGINT', shutDown);
 }
 
 module.exports = {
