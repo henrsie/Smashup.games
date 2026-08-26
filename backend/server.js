@@ -110,12 +110,18 @@ function addLobbyBot(room, requesterId, roomId = 'ROOM') {
         return failGameAction('lobby_full', `A game can have at most ${MAX_PLAYERS} players.`);
     }
 
-    let botNumber = Number.isInteger(room.nextBotNumber) ? room.nextBotNumber : 1;
-    const existingNames = new Set(room.players.map(player => player.name.toLowerCase()));
-    while (existingNames.has(`bot${botNumber}`)) botNumber += 1;
+    const botNumber = room.players.filter(player => player.isBot === true).length + 1;
+    let botIdNumber = Number.isInteger(room.nextBotIdNumber)
+        ? room.nextBotIdNumber
+        : Number.isInteger(room.nextBotNumber)
+            ? room.nextBotNumber
+            : 1;
+    while (room.players.some(player => player.id === `bot-${roomId}-${botIdNumber}`)) {
+        botIdNumber += 1;
+    }
 
     const bot = {
-        id: `bot-${roomId}-${botNumber}`,
+        id: `bot-${roomId}-${botIdNumber}`,
         name: `bot${botNumber}`,
         hand: [],
         deck: [],
@@ -124,9 +130,36 @@ function addLobbyBot(room, requesterId, roomId = 'ROOM') {
         isBot: true
     };
 
-    room.nextBotNumber = botNumber + 1;
+    room.nextBotIdNumber = botIdNumber + 1;
     room.players.push(bot);
     return { ok: true, role: 'player', participant: bot };
+}
+
+function renumberLobbyBots(room) {
+    room.players
+        .filter(player => player.isBot === true)
+        .forEach((bot, index) => {
+            bot.name = `bot${index + 1}`;
+        });
+}
+
+function removeLobbyBot(room, requesterId, botId) {
+    if (!room) return failGameAction('room_not_found', 'Room not found.');
+    if (room.gamePhase !== 'lobby') {
+        return failGameAction('invalid_phase', 'Bots can only be removed while the game is in the lobby.');
+    }
+    if (room.host !== requesterId) {
+        return failGameAction('host_required', 'Only the host can remove bots.');
+    }
+
+    const botIndex = room.players.findIndex(player => player.id === botId && player.isBot === true);
+    if (botIndex === -1) {
+        return failGameAction('bot_not_found', 'That bot is not in this lobby.');
+    }
+
+    const [bot] = room.players.splice(botIndex, 1);
+    renumberLobbyBots(room);
+    return { ok: true, participant: bot };
 }
 
 function getNextHumanHostId(room) {
@@ -160,7 +193,7 @@ io.on('connection', (socket) => {
             host: socket.id,
             players: [{ id: socket.id, name: playerName, hand: [], deck: [], discardPile: [], online: true }],
             spectators: [],
-            nextBotNumber: 1,
+            nextBotIdNumber: 1,
             gamePhase: 'lobby',
             pendingAbility: null,
             temporaryEffects: [],
@@ -269,6 +302,18 @@ io.on('connection', (socket) => {
     socket.on('add-bot', ({ roomId } = {}) => {
         const room = rooms[roomId];
         const result = addLobbyBot(room, socket.id, roomId);
+        if (!result.ok) return socket.emit('error', result.error);
+
+        io.to(roomId).emit('update-players', {
+            players: room.players,
+            spectators: room.spectators || [],
+            host: room.host
+        });
+    });
+
+    socket.on('remove-bot', ({ roomId, botId } = {}) => {
+        const room = rooms[roomId];
+        const result = removeLobbyBot(room, socket.id, botId);
         if (!result.ok) return socket.emit('error', result.error);
 
         io.to(roomId).emit('update-players', {
@@ -5156,6 +5201,7 @@ module.exports = {
     recalculateOngoingEffects,
     resolveEndTurnActions,
     resolveDeckReorder,
+    removeLobbyBot,
     resolveMultiZoneSelection,
     resolveSelectedPlayerBoardEffect,
     resolveSelectedPlayerBoardEffectBase,

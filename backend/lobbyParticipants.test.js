@@ -4,6 +4,7 @@ const {
     MAX_PLAYERS,
     addLobbyBot,
     addLobbyParticipant,
+    removeLobbyBot,
     roomHasHumanPlayers
 } = require('./server.js');
 
@@ -107,4 +108,35 @@ test('a room with only bot seats has no human players', () => {
     room.players = room.players.filter(player => player.isBot === true);
 
     assert.equal(roomHasHumanPlayers(room), false);
+});
+
+test('removing a bot compacts the visible numbering and the next bot continues it', () => {
+    const room = createLobby(1);
+    addLobbyBot(room, 'player-1', 'ROOM1');
+    addLobbyBot(room, 'player-1', 'ROOM1');
+    addLobbyBot(room, 'player-1', 'ROOM1');
+
+    const result = removeLobbyBot(room, 'player-1', 'bot-ROOM1-2');
+
+    assert.equal(result.ok, true);
+    assert.equal(result.participant.name, 'bot2');
+    assert.deepEqual(room.players.map(player => player.name), ['Player 1', 'bot1', 'bot2']);
+
+    const replacement = addLobbyBot(room, 'player-1', 'ROOM1');
+
+    assert.equal(replacement.participant.name, 'bot3');
+    assert.deepEqual(room.players.map(player => player.name), ['Player 1', 'bot1', 'bot2', 'bot3']);
+    assert.equal(new Set(room.players.map(player => player.id)).size, room.players.length);
+});
+
+test('a non-host cannot remove bots or human seats', () => {
+    const room = createLobby(1);
+    addLobbyBot(room, 'player-1', 'ROOM1');
+
+    const nonHostResult = removeLobbyBot(room, 'player-2', 'bot-ROOM1-1');
+    const humanResult = removeLobbyBot(room, 'player-1', 'player-1');
+
+    assert.equal(nonHostResult.code, 'host_required');
+    assert.equal(humanResult.code, 'bot_not_found');
+    assert.deepEqual(room.players.map(player => player.name), ['Player 1', 'bot1']);
 });

@@ -472,6 +472,10 @@ function App() {
     socket.emit('add-bot', { roomId: currentRoom });
   };
 
+  const handleRemoveBot = (botId) => {
+    socket.emit('remove-bot', { roomId: currentRoom, botId });
+  };
+
   const handleDraftFaction = (factionName) => {
     socket.emit('draft-faction', { roomId: currentRoom, factionName });
   };
@@ -1783,6 +1787,14 @@ function App() {
                 {p.name} {p.id === socket.id ? '(You)' : ''}
                 {p.isBot ? ' 🤖 (Bot)' : ''}
                 {p.id === hostId ? ' 👑 (Host)' : ''}
+                {isHost && p.isBot && (
+                  <button
+                    onClick={() => handleRemoveBot(p.id)}
+                    style={{ marginLeft: '10px', padding: '3px 8px', backgroundColor: '#d9534f', color: 'white', border: 'none', borderRadius: '3px', cursor: 'pointer' }}
+                  >
+                    Remove
+                  </button>
+                )}
               </li>
             ))}
           </ul>
