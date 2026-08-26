@@ -19,6 +19,9 @@ const SOCKET_CORS_OPTIONS = {
 const MAX_PLAYERS = 4;
 const MAX_CHAT_HISTORY = 100;
 const MAX_CHAT_MESSAGE_LENGTH = 500;
+const BOT_ACTION_DELAY_MS = 600;
+const MAX_CONSECUTIVE_BOT_ACTIONS = 100;
+const DISCONNECT_GRACE_PERIOD_MS = 10_000;
 const createInitialTurnState = () => ({
     actionPlayed: false,
     minionPlayed: false,
@@ -56,6 +59,23 @@ const io = new Server(server, {
 const rooms = {};
 // Keep track of active disconnection timers: playerId -> NodeJS.Timeout
 const disconnectTimers = {};
+const botTurnController = createBotTurnController({
+    getRoom: roomId => rooms[roomId],
+    executeAction: ({ room, roomId, actorId, action }) => executeGameAction({
+        room,
+        roomId,
+        actorId,
+        action,
+        emitState: emitGameState,
+        emitRoomEvent: (targetRoomId, event, payload) => {
+            io.to(targetRoomId).emit(event, payload);
+        },
+        roomStillExists: () => rooms[roomId] === room
+    }),
+    onError: ({ roomId, actorId, error }) => {
+        console.error(`Bot controller error in ${roomId} for ${actorId}: ${error.message}`);
+    }
+});
 
 function addLobbyParticipant(room, participant) {
     if (!room.spectators) room.spectators = [];
@@ -78,6 +98,59 @@ function addLobbyParticipant(room, participant) {
     return { role: 'player', participant: player };
 }
 
+function addLobbyBot(room, requesterId, roomId = 'ROOM') {
+    if (!room) return failGameAction('room_not_found', 'Room not found.');
+    if (room.gamePhase !== 'lobby') {
+        return failGameAction('invalid_phase', 'Bots can only be added while the game is in the lobby.');
+    }
+    if (room.host !== requesterId) {
+        return failGameAction('host_required', 'Only the host can add bots.');
+    }
+    if (room.players.length >= MAX_PLAYERS) {
+        return failGameAction('lobby_full', `A game can have at most ${MAX_PLAYERS} players.`);
+    }
+
+    let botNumber = Number.isInteger(room.nextBotNumber) ? room.nextBotNumber : 1;
+    const existingNames = new Set(room.players.map(player => player.name.toLowerCase()));
+    while (existingNames.has(`bot${botNumber}`)) botNumber += 1;
+
+    const bot = {
+        id: `bot-${roomId}-${botNumber}`,
+        name: `bot${botNumber}`,
+        hand: [],
+        deck: [],
+        discardPile: [],
+        online: true,
+        isBot: true
+    };
+
+    room.nextBotNumber = botNumber + 1;
+    room.players.push(bot);
+    return { ok: true, role: 'player', participant: bot };
+}
+
+function getNextHumanHostId(room) {
+    return room.players.find(player => player.isBot !== true)?.id || null;
+}
+
+function roomHasHumanPlayers(room) {
+    return room.players.some(player => player.isBot !== true);
+}
+
+function destroyRoom(roomId) {
+    const room = rooms[roomId];
+    if (!room) return false;
+
+    room.players.forEach(player => {
+        if (!disconnectTimers[player.id]) return;
+        clearTimeout(disconnectTimers[player.id]);
+        delete disconnectTimers[player.id];
+    });
+    botTurnController.stop(roomId);
+    delete rooms[roomId];
+    return true;
+}
+
 io.on('connection', (socket) => {
     console.log(`User connected: ${socket.id}`);
 
@@ -87,6 +160,7 @@ io.on('connection', (socket) => {
             host: socket.id,
             players: [{ id: socket.id, name: playerName, hand: [], deck: [], discardPile: [], online: true }],
             spectators: [],
+            nextBotNumber: 1,
             gamePhase: 'lobby',
             pendingAbility: null,
             temporaryEffects: [],
@@ -111,7 +185,7 @@ io.on('connection', (socket) => {
             const exactName = playerName.trim();
 
             // 1. Check if an existing ACTIVE or OFFLINE player is reconnecting with the exact same name
-            const existingPlayer = room.players.find(p => p.name === exactName);
+            const existingPlayer = room.players.find(p => p.isBot !== true && p.name === exactName);
 
             if (room.gamePhase && room.gamePhase !== 'lobby' && existingPlayer) {
                 // Clear any active kick timer since they returned!
@@ -192,6 +266,18 @@ io.on('connection', (socket) => {
         }
     });
 
+    socket.on('add-bot', ({ roomId } = {}) => {
+        const room = rooms[roomId];
+        const result = addLobbyBot(room, socket.id, roomId);
+        if (!result.ok) return socket.emit('error', result.error);
+
+        io.to(roomId).emit('update-players', {
+            players: room.players,
+            spectators: room.spectators || [],
+            host: room.host
+        });
+    });
+
     socket.on('send-chat-message', ({ roomId, message }) => {
         const room = rooms[roomId];
         if (!room || !socket.rooms.has(roomId)) return;
@@ -203,369 +289,49 @@ io.on('connection', (socket) => {
         io.to(roomId).emit('chat-message', result.message);
     });
 
-    socket.on('play-card', ({ roomId, cardInstanceId, baseIndex, targetMinionInstanceId, fromDiscard = false }) => {
-        const room = rooms[roomId];
-        if (!room || room.gamePhase !== 'playing') return;
+    socket.on('play-card', (payload = {}) => {
+        const { roomId, ...command } = payload || {};
+        const result = executeGameAction({
+            room: rooms[roomId],
+            roomId,
+            actorId: socket.id,
+            action: { ...command, type: 'play-card' },
+            actorTransport: socket,
+            emitState: emitGameState
+        });
 
-        if (room.currentTurnPlayerId !== socket.id) {
-            return socket.emit('error', "It's not your turn!");
-        }
-
-        const player = room.players.find(p => p.id === socket.id);
-        if (!player) return;
-
-        const sourcePile = fromDiscard ? player.discardPile : player.hand;
-        const cardIndex = sourcePile.findIndex(c => c.instanceId === cardInstanceId);
-        if (cardIndex === -1) {
-            return socket.emit('error', `Card not found in your ${fromDiscard ? 'discard pile' : 'hand'}!`);
-        }
-
-        const card = sourcePile[cardIndex];
-        const requiredExtraMinionPlayIndex = room.turnState.extraMinionPlays.findIndex(permission => permission.required);
-        const requiredExtraMinionPlay = room.turnState.extraMinionPlays[requiredExtraMinionPlayIndex];
-        if (requiredExtraMinionPlay
-            && (card.type !== 'minion'
-                || fromDiscard
-                || !minionPlayPermissionMatches(room, socket.id, card, baseIndex, requiredExtraMinionPlay))) {
-            return socket.emit('error', `You must play the Talent's extra minion at ${room.activeBases[requiredExtraMinionPlay.allowedBaseIndex]?.name || 'the required base'} first.`);
-        }
-
-        if (fromDiscard) {
-            const allowedBaseIndices = getOngoingDiscardPlayBaseIndices(room, socket.id);
-            if (card.type !== 'minion'
-                || room.turnState.ongoingDiscardMinionPlayed
-                || !allowedBaseIndices.includes(baseIndex)) {
-                return socket.emit('error', 'No ongoing ability allows that discard-pile play.');
-            }
-        }
-
-        // 🛑 TURN LIMIT VALIDATION (Enforce 1 Minion & 1 Action per turn)
-        let extraMinionPlayIndex = requiredExtraMinionPlayIndex;
-        if (card.type === 'minion') {
-            if (room.turnState.minionPlayed && extraMinionPlayIndex === -1) {
-                extraMinionPlayIndex = room.turnState.extraMinionPlays.findIndex(permission => (
-                    minionPlayPermissionMatches(room, socket.id, card, baseIndex, permission)
-                ));
-            }
-            if (room.turnState.minionPlayed && extraMinionPlayIndex === -1) {
-                return socket.emit('error', 'You have already played a minion this turn!');
-            }
-        } else if (card.type === 'action') {
-            if (room.turnState.actionPlayed && room.turnState.extraActionPlays <= 0) {
-                return socket.emit('error', 'You have already played an action this turn!');
-            }
-        }
-
-        // HANDLING SUBTYPES & TARGET VALIDATION
-        let targetMinion = null;
-        let targetBase = null;
-
-        if (card.subtype === 'base') {
-            if (baseIndex === null || baseIndex === undefined || !room.activeBases[baseIndex]) {
-                return socket.emit('error', 'Target base does not exist');
-            }
-            targetBase = room.activeBases[baseIndex];
-        } else if (card.subtype === 'ally-minion' || card.subtype === 'enemy-minion' || card.subtype === 'neutral-minion') {
-            if (baseIndex !== null && baseIndex !== undefined && room.activeBases[baseIndex]) {
-                targetBase = room.activeBases[baseIndex];
-                targetMinion = (targetBase.playedCards || []).find(c => c.type === 'minion' && c.instanceId === targetMinionInstanceId);
-            } else {
-                for (const b of room.activeBases) {
-                    const found = (b.playedCards || []).find(c => c.type === 'minion' && c.instanceId === targetMinionInstanceId);
-                    if (found) {
-                        targetMinion = found;
-                        targetBase = b;
-                        break;
-                    }
-                }
-            }
-
-            if (!targetMinion) {
-                return socket.emit('error', 'Target minion does not exist');
-            }
-
-            const isAlly = targetMinion.ownerId === socket.id;
-            if (card.subtype === 'ally-minion' && !isAlly) {
-                return socket.emit('error', 'Target must be your own minion');
-            }
-            if (card.subtype === 'enemy-minion' && isAlly) {
-                return socket.emit('error', 'Target must be an enemy minion');
-            }
-            if (isMinionProtectedFromCard(room, targetBase, targetMinion, socket.id, card.type)) {
-                return socket.emit('error', `${targetMinion.name} is protected from this card.`);
-            }
-        }
-
-        if (card.type === 'minion' && targetBase && isMinionPlayPrevented(targetBase, socket.id)) {
-            return socket.emit('error', `You cannot play a minion on ${targetBase.name}.`);
-        }
-
-        // Remove the card from its validated source zone now that validation passed.
-        sourcePile.splice(cardIndex, 1);
-        const playedCard = { ...card, ownerName: player.name, ownerId: player.id };
-
-        // Route card based on discard flag and subtype destination & Build Battle Log Entry
-        let logMessage = '';
-        let targetName = null;
-
-        if (card.discard === 'yes' && card.subtype === 'neither') {
-            // Standard action with no target that discards immediately
-            if (!player.discardPile) player.discardPile = [];
-            player.discardPile.push(playedCard);
-            logMessage = `**${player.name}** plays **${card.name}**`;
-        } else {
-            // Cards that target a base or minion (whether permanent or delayed-discard)
-            if (card.subtype === 'base') {
-                const base = room.activeBases[baseIndex];
-                if (!base.playedCards) base.playedCards = [];
-                base.playedCards.push(playedCard);
-                targetName = base.name;
-                logMessage = `**${player.name}** plays **${card.name}** on **${base.name}**`;
-            } else if (card.subtype === 'ally-minion' || card.subtype === 'enemy-minion' || card.subtype === 'neutral-minion') {
-                if (!targetMinion.attachedCards) {
-                    targetMinion.attachedCards = [];
-                }
-                targetMinion.attachedCards.push(playedCard);
-                targetName = targetMinion.name;
-                logMessage = `**${player.name}** plays **${card.name}** on **${targetMinion ? targetMinion.name : 'Target Minion'}**`;
-            } else {
-                // Fallback for any other 'yes' discard action
-                if (!player.discardPile) player.discardPile = [];
-                player.discardPile.push(playedCard);
-                logMessage = `**${player.name}** plays **${card.name}**`;
-            }
-        }
-
-        // 🔒 UPDATE TURN STATE FLAGS (Mark minion or action as used)
-        if (card.type === 'minion') {
-            if (extraMinionPlayIndex >= 0) room.turnState.extraMinionPlays.splice(extraMinionPlayIndex, 1);
-            else room.turnState.minionPlayed = true;
-            room.turnState.minionsPlayed += 1;
-            if (fromDiscard) room.turnState.ongoingDiscardMinionPlayed = true;
-        } else if (card.type === 'action') {
-            if (room.turnState.actionPlayed) room.turnState.extraActionPlays -= 1;
-            room.turnState.actionPlayed = true;
-            room.turnState.actionsPlayed += 1;
-        }
-
-        // Initialize battleLog if missing and push new entry
-        if (!room.battleLog) room.battleLog = [];
-        room.battleLog.unshift({
-            message: logMessage,
-            card: playedCard,
-            playerName: player.name,
-            targetName,
-            targetCard: targetMinion
-        }); // Newest entries at the top
-
-        recalculateOngoingEffects(room);
-        resolveOnPlayBoardEffects({ room, roomId, socket, playedCard, targetBase, targetMinion });
-        recalculateOngoingEffects(room);
-        if (card.type === 'minion' && targetBase) {
-            queueAfterMinionPlayedBaseAbilities(room, targetBase, playedCard);
-        }
-
-        emitGameState(roomId, room);
+        if (!result.ok) socket.emit('error', result.error);
     });
 
-    socket.on('use-talent', ({ roomId, cardInstanceId }) => {
-        const room = rooms[roomId];
-        if (!room || room.gamePhase !== 'playing') return;
-        if (room.currentTurnPlayerId !== socket.id) {
-            return socket.emit('error', "It's not your turn!");
-        }
-        if (room.pendingAbility) {
-            return socket.emit('error', 'Resolve the pending ability before using a Talent.');
-        }
-        if (room.turnState.extraMinionPlays.some(permission => permission.required)) {
-            return socket.emit('error', "Play the Talent's required extra minion first.");
-        }
+    socket.on('use-talent', (payload = {}) => {
+        const { roomId, ...command } = payload || {};
+        const result = executeGameAction({
+            room: rooms[roomId],
+            roomId,
+            actorId: socket.id,
+            action: { ...command, type: 'use-talent' },
+            emitState: emitGameState
+        });
 
-        const result = activateTalent(room, socket.id, cardInstanceId);
-        if (!result.ok) return socket.emit('error', result.error);
-        emitGameState(roomId, room);
+        if (!result.ok) socket.emit('error', result.error);
     });
 
-    socket.on('end-turn', ({ roomId }) => {
+    socket.on('end-turn', (payload = {}) => {
+        const { roomId } = payload || {};
         const room = rooms[roomId];
-        if (!room || room.gamePhase !== 'playing') return;
+        const result = executeGameAction({
+            room,
+            roomId,
+            actorId: socket.id,
+            action: { type: 'end-turn' },
+            emitState: emitGameState,
+            emitRoomEvent: (targetRoomId, event, eventPayload) => {
+                io.to(targetRoomId).emit(event, eventPayload);
+            },
+            roomStillExists: () => rooms[roomId] === room
+        });
 
-        if (room.pendingAbility) {
-            return socket.emit('error', 'Resolve the pending ability before ending your turn.');
-        }
-
-        if (room.turnState.extraMinionPlays.some(permission => permission.required)) {
-            return socket.emit('error', "Play the Talent's required extra minion before ending your turn.");
-        }
-
-        if (room.currentTurnPlayerId !== socket.id) {
-            return socket.emit('error', "It's not your turn!");
-        }
-
-        const player = room.players.find(p => p.id === socket.id);
-        if (!player) return;
-
-        resolveEndTurnActions(room);
-        if (processNextTriggeredAbility(room, roomId)) {
-            emitGameState(roomId, room);
-            return;
-        }
-
-        // 🧹 SHARED CLEANUP FUNCTION: Move temporary/delayed-discard action cards from bases/minions to discard piles
-        const cleanupDelayedDiscardCards = () => {
-            room.activeBases.forEach(base => {
-                if (base.playedCards) {
-                    // Filter out base-action cards that have discard === 'yes'
-                    base.playedCards = base.playedCards.filter(card => {
-                        if (card.type === 'action' && card.discard === 'yes') {
-                            const owner = room.players.find(p => p.id === card.ownerId);
-                            if (owner) {
-                                if (!owner.discardPile) owner.discardPile = [];
-                                owner.discardPile.push(card);
-                            }
-                            return false; // Remove from base
-                        }
-                        return true; // Keep on base
-                    });
-
-                    // Also check attached cards on minions at this base
-                    base.playedCards.forEach(card => {
-                        if (card.type === 'minion' && card.attachedCards) {
-                            card.attachedCards = card.attachedCards.filter(attached => {
-                                if (attached.type === 'action' && attached.discard === 'yes') {
-                                    const owner = room.players.find(p => p.id === attached.ownerId);
-                                    if (owner) {
-                                        if (!owner.discardPile) owner.discardPile = [];
-                                        owner.discardPile.push(attached);
-                                    }
-                                    return false; // Remove from minion attachment
-                                }
-                                return true; // Keep attached
-                            });
-                        }
-                    });
-                }
-            });
-        };
-
-        // 1. Check for bases ready to score
-        const scoringBases = getScoringBases(room);
-
-        if (scoringBases.length > 0) {
-            if (!room.battleLog) room.battleLog = [];
-            scoringBases.forEach(baseIndex => {
-                const base = room.activeBases[baseIndex];
-                room.battleLog.unshift(`**${base.name}** is scoring!`);
-            });
-
-            const activePlayer = room.players.find(p => p.id === room.currentTurnPlayerId);
-            if (activePlayer) {
-                room.battleLog.unshift(`**${activePlayer.name}** has ended their turn`);
-            }
-
-            room.gamePhase = 'scoring';
-
-            io.to(roomId).emit('game-state-update', {
-                players: room.players,
-                activeBases: room.activeBases,
-                currentTurnPlayerId: room.currentTurnPlayerId,
-                turnState: room.turnState,
-                gamePhase: room.gamePhase,
-                scoringBases,
-                battleLog: room.battleLog
-            });
-
-            // 5-Second Timer before resolving base scoring and passing turn
-            setTimeout(() => {
-                // Ensure room still exists
-                if (!rooms[roomId]) return;
-
-                const finishScoringTurn = () => {
-                    for (let index = 0; index < 2; index += 1) {
-                        if (player.deck.length > 0) player.hand.push(player.deck.shift());
-                    }
-
-                    const currentPlayerIndex = room.players.findIndex(candidate => candidate.id === socket.id);
-                    cleanupDelayedDiscardCards();
-                    clearTemporaryEffects(room);
-
-                    const nextPlayerIndex = (currentPlayerIndex + 1) % room.players.length;
-                    room.currentTurnPlayerId = room.players[nextPlayerIndex].id;
-                    room.turnState = createInitialTurnState();
-                    room.gamePhase = 'playing';
-                    const nextPlayer = room.players[nextPlayerIndex];
-                    if (nextPlayer) {
-                        if (!room.battleLog) room.battleLog = [];
-                        room.battleLog.unshift(`**${nextPlayer.name}**'s turn`);
-                        resolveStartTurnActions(room, nextPlayer.id);
-                    }
-                };
-
-                const scoreEligibleBases = () => {
-                    scoringBases.forEach(baseIndex => {
-                        scoreBase(room, baseIndex);
-                    });
-                    room.afterTriggeredAbilitiesResolved = finishScoringTurn;
-                    if (!processNextTriggeredAbility(room, roomId)) {
-                        finishAfterTriggeredAbilities(room);
-                    }
-                };
-
-                room.afterTriggeredAbilitiesResolved = scoreEligibleBases;
-                queueBeforeBaseScoringSpecials(room, scoringBases);
-                if (!processNextTriggeredAbility(room, roomId)) {
-                    finishAfterTriggeredAbilities(room);
-                }
-                emitGameState(roomId, room);
-            }, 5000); // 5 seconds delay
-
-        } else {
-            // If no bases are scoring, proceed normally right away
-            for (let i = 0; i < 2; i++) {
-                if (player.deck.length > 0) {
-                    player.hand.push(player.deck.shift());
-                }
-            }
-
-            const currentPlayerIndex = room.players.findIndex(p => p.id === socket.id);
-            const activePlayer = room.players.find(p => p.id === room.currentTurnPlayerId);
-
-            // 🏆 END TURN LOG ENTRY
-            if (activePlayer) {
-                if (!room.battleLog) room.battleLog = [];
-                room.battleLog.unshift(`**${activePlayer.name}** has ended their turn`);
-            }
-
-            // 🧹 Run cleanup sweep for normal turns where no base scored!
-            cleanupDelayedDiscardCards();
-            clearTemporaryEffects(room);
-
-            // rotate to the next player 
-            const nextPlayerIndex = (currentPlayerIndex + 1) % room.players.length;
-            room.currentTurnPlayerId = room.players[nextPlayerIndex].id;
-
-            room.turnState = createInitialTurnState();
-
-            // Return phase to playing and update all clients
-            room.gamePhase = 'playing';
-            const nextPlayer = room.players.find(p => p.id === room.currentTurnPlayerId);
-
-            // 🏆 ADD TURN START LOG ENTRY
-            if (nextPlayer) {
-                if (!room.battleLog) room.battleLog = [];
-                room.battleLog.unshift(`**${nextPlayer.name}**'s turn`);
-                resolveStartTurnActions(room, nextPlayer.id);
-            }
-
-            io.to(roomId).emit('game-state-update', {
-                players: room.players,
-                activeBases: room.activeBases,
-                currentTurnPlayerId: room.currentTurnPlayerId,
-                turnState: room.turnState,
-                gamePhase: room.gamePhase,
-                battleLog: room.battleLog
-            });
-        }
+        if (!result.ok) socket.emit('error', result.error);
     });
 
     socket.on('leave-room', ({ roomId }) => {
@@ -588,24 +354,26 @@ io.on('connection', (socket) => {
                 room.players = room.players.filter(p => p.id !== socket.id);
                 socket.leave(roomId);
 
-                if (room.players.length === 0) {
-                    delete rooms[roomId];
+                const nextHumanHostId = getNextHumanHostId(room);
+                if (!nextHumanHostId) {
+                    io.to(roomId).emit('room-reset', { message: 'All human players have left. The room has been closed.' });
+                    destroyRoom(roomId);
                 } else {
                     if (room.host === socket.id) {
-                        room.host = room.players[0].id;
+                        room.host = nextHumanHostId;
                     }
                     io.to(roomId).emit('update-players', { players: room.players, spectators: room.spectators || [], host: room.host });
                 }
             } else if (room.gamePhase === 'drafting') {
                 io.to(roomId).emit('room-reset', { message: 'A player left during the faction draft. The room has been closed.' });
-                delete rooms[roomId];
+                destroyRoom(roomId);
             } else if (room.gamePhase === 'playing' || room.gamePhase === 'scoring') {
                 const player = room.players.find(p => p.id === socket.id);
                 if (player) {
                     player.online = false;
                     disconnectTimers[player.id] = setTimeout(() => {
                         handlePlayerKick(roomId, player.id);
-                    }, 3000);
+                    }, DISCONNECT_GRACE_PERIOD_MS);
                 }
 
                 if (room.spectators) {
@@ -631,24 +399,26 @@ io.on('connection', (socket) => {
             if (player) {
                 if (room.gamePhase === 'lobby') {
                     room.players = room.players.filter(p => p.id !== socket.id);
-                    if (room.players.length === 0) {
-                        delete rooms[roomId];
+                    const nextHumanHostId = getNextHumanHostId(room);
+                    if (!nextHumanHostId) {
+                        io.to(roomId).emit('room-reset', { message: 'All human players have left. The room has been closed.' });
+                        destroyRoom(roomId);
                     } else {
                         if (room.host === socket.id) {
-                            room.host = room.players[0].id;
+                            room.host = nextHumanHostId;
                         }
                         io.to(roomId).emit('update-players', { players: room.players, spectators: room.spectators || [], host: room.host });
                     }
                 } else if (room.gamePhase === 'drafting') {
                     io.to(roomId).emit('room-reset', { message: 'A player disconnected during the faction draft. The room has been closed.' });
-                    delete rooms[roomId];
+                    destroyRoom(roomId);
                 } else if (room.gamePhase === 'playing' || room.gamePhase === 'scoring') {
                     player.online = false;
                     io.to(roomId).emit('update-players', { players: room.players, spectators: room.spectators || [], host: room.host });
 
                     disconnectTimers[player.id] = setTimeout(() => {
                         handlePlayerKick(roomId, player.id);
-                    }, 3000);
+                    }, DISCONNECT_GRACE_PERIOD_MS);
                 }
                 break;
             }
@@ -681,67 +451,579 @@ io.on('connection', (socket) => {
                 players: room.players,
                 spectators: room.spectators || []
             });
+            botTurnController.wake(roomId);
         } else {
             socket.emit('error', 'Only the host can start the game!');
         }
     });
 
-    socket.on('draft-faction', ({ roomId, factionName }) => {
-        const room = rooms[roomId];
-        if (!room || room.gamePhase !== 'drafting') return;
+    socket.on('draft-faction', (payload = {}) => {
+        const { roomId, ...command } = payload || {};
+        const result = executeGameAction({
+            room: rooms[roomId],
+            roomId,
+            actorId: socket.id,
+            action: { ...command, type: 'draft-faction' },
+            emitRoomEvent: (targetRoomId, event, eventPayload) => {
+                io.to(targetRoomId).emit(event, eventPayload);
+            }
+        });
 
-        const draft = room.draftState;
-        const currentPickerId = draft.draftOrder[draft.currentTurnIndex];
+        if (!result.ok) socket.emit('error', result.error);
+        else botTurnController.wake(roomId);
+    });
 
-        if (socket.id !== currentPickerId) {
-            return socket.emit('error', 'It is not your turn to draft!');
+    socket.on('resolve-ability-choice', (payload = {}) => {
+        const { roomId, choice } = payload || {};
+        const result = executeGameAction({
+            room: rooms[roomId],
+            roomId,
+            actorId: socket.id,
+            action: { type: 'resolve-ability-choice', choice },
+            actorTransport: socket,
+            emitState: emitGameState
+        });
+
+        if (!result.ok) socket.emit('error', result.error);
+    });
+});
+
+function failGameAction(code, error) {
+    return { ok: false, code, error };
+}
+
+function createActionActor(actorId, actorTransport) {
+    const actorEvents = [];
+    const actor = {
+        id: actorId,
+        emit(event, payload) {
+            actorEvents.push({ event, payload });
+            if (actorTransport?.emit) actorTransport.emit(event, payload);
+        }
+    };
+
+    return { actor, actorEvents };
+}
+
+function emitActorEvent(actor, event, payload) {
+    if (typeof actor?.emit === 'function') actor.emit(event, payload);
+    else if (actor?.id) io.to(actor.id).emit(event, payload);
+}
+
+function validatePlayCardAction(room, actorId, action) {
+    if (!room) return failGameAction('room_not_found', 'Room not found.');
+    if (room.gamePhase !== 'playing') {
+        return failGameAction('invalid_phase', 'Cards can only be played during the playing phase.');
+    }
+    if (room.pendingAbility) {
+        return failGameAction('pending_ability', 'Resolve the pending ability before playing another card.');
+    }
+    if (room.currentTurnPlayerId !== actorId) {
+        return failGameAction('not_your_turn', "It's not your turn!");
+    }
+
+    const player = room.players.find(candidate => candidate.id === actorId);
+    if (!player) return failGameAction('player_not_found', 'Player not found in this room.');
+
+    const fromDiscard = Boolean(action.fromDiscard);
+    const sourcePile = fromDiscard ? player.discardPile : player.hand;
+    const cardIndex = sourcePile.findIndex(card => card.instanceId === action.cardInstanceId);
+    if (cardIndex === -1) {
+        return failGameAction(
+            'card_not_found',
+            `Card not found in your ${fromDiscard ? 'discard pile' : 'hand'}!`
+        );
+    }
+
+    const card = sourcePile[cardIndex];
+    const baseIndex = action.baseIndex;
+    const requiredExtraMinionPlayIndex = room.turnState.extraMinionPlays
+        .findIndex(permission => permission.required);
+    const requiredExtraMinionPlay = room.turnState.extraMinionPlays[requiredExtraMinionPlayIndex];
+    if (requiredExtraMinionPlay
+        && (card.type !== 'minion'
+            || fromDiscard
+            || !minionPlayPermissionMatches(room, actorId, card, baseIndex, requiredExtraMinionPlay))) {
+        return failGameAction(
+            'required_extra_minion',
+            `You must play the Talent's extra minion at ${room.activeBases[requiredExtraMinionPlay.allowedBaseIndex]?.name || 'the required base'} first.`
+        );
+    }
+
+    if (fromDiscard) {
+        const allowedBaseIndices = getOngoingDiscardPlayBaseIndices(room, actorId);
+        if (card.type !== 'minion'
+            || room.turnState.ongoingDiscardMinionPlayed
+            || !allowedBaseIndices.includes(baseIndex)) {
+            return failGameAction('discard_play_not_allowed', 'No ongoing ability allows that discard-pile play.');
+        }
+    }
+
+    let extraMinionPlayIndex = requiredExtraMinionPlayIndex;
+    if (card.type === 'minion') {
+        if (room.turnState.minionPlayed && extraMinionPlayIndex === -1) {
+            extraMinionPlayIndex = room.turnState.extraMinionPlays.findIndex(permission => (
+                minionPlayPermissionMatches(room, actorId, card, baseIndex, permission)
+            ));
+        }
+        if (room.turnState.minionPlayed && extraMinionPlayIndex === -1) {
+            return failGameAction('minion_limit_reached', 'You have already played a minion this turn!');
+        }
+    } else if (card.type === 'action') {
+        if (room.turnState.actionPlayed && room.turnState.extraActionPlays <= 0) {
+            return failGameAction('action_limit_reached', 'You have already played an action this turn!');
+        }
+    } else {
+        return failGameAction('invalid_card_type', 'That card type cannot be played.');
+    }
+
+    let targetMinion = null;
+    let targetBase = null;
+    if (card.subtype === 'base') {
+        if (baseIndex === null || baseIndex === undefined || !room.activeBases[baseIndex]) {
+            return failGameAction('invalid_base_target', 'Target base does not exist');
+        }
+        targetBase = room.activeBases[baseIndex];
+    } else if (['ally-minion', 'enemy-minion', 'neutral-minion'].includes(card.subtype)) {
+        if (baseIndex !== null && baseIndex !== undefined && room.activeBases[baseIndex]) {
+            targetBase = room.activeBases[baseIndex];
+            targetMinion = (targetBase.playedCards || []).find(candidate => (
+                candidate.type === 'minion'
+                && candidate.instanceId === action.targetMinionInstanceId
+            ));
+        } else {
+            for (const candidateBase of room.activeBases) {
+                const found = (candidateBase.playedCards || []).find(candidate => (
+                    candidate.type === 'minion'
+                    && candidate.instanceId === action.targetMinionInstanceId
+                ));
+                if (found) {
+                    targetMinion = found;
+                    targetBase = candidateBase;
+                    break;
+                }
+            }
         }
 
-        if (!draft.availableFactions.includes(factionName)) {
-            return socket.emit('error', 'That faction is already taken!');
+        if (!targetMinion) {
+            return failGameAction('invalid_minion_target', 'Target minion does not exist');
         }
 
-        draft.availableFactions = draft.availableFactions.filter(f => f !== factionName);
-        draft.picks[socket.id].push(factionName);
-        draft.currentTurnIndex++;
+        const isAlly = targetMinion.ownerId === actorId;
+        if (card.subtype === 'ally-minion' && !isAlly) {
+            return failGameAction('target_not_ally', 'Target must be your own minion');
+        }
+        if (card.subtype === 'enemy-minion' && isAlly) {
+            return failGameAction('target_not_enemy', 'Target must be an enemy minion');
+        }
+        if (isMinionProtectedFromCard(room, targetBase, targetMinion, actorId, card.type)) {
+            return failGameAction(
+                'target_protected',
+                `${targetMinion.name} is protected from this card.`
+            );
+        }
+    }
 
-        if (draft.currentTurnIndex >= draft.draftOrder.length) {
-            room.gamePhase = 'playing';
+    if (card.type === 'minion' && targetBase && isMinionPlayPrevented(targetBase, actorId)) {
+        return failGameAction('minion_play_prevented', `You cannot play a minion on ${targetBase.name}.`);
+    }
 
-            // Build and shuffle base deck, then draw 3 active bases
-            const baseDeck = buildBaseDeck();
-            room.activeBases = baseDeck.splice(0, 3).map(base => ({
-                ...base,
-                playedCards: []
-            }));
-            room.baseDeck = baseDeck;
+    return {
+        ok: true,
+        card,
+        cardIndex,
+        extraMinionPlayIndex,
+        fromDiscard,
+        player,
+        sourcePile,
+        targetBase,
+        targetMinion
+    };
+}
 
-            room.players.forEach(player => {
-                const playerFactions = draft.picks[player.id] || ['Aliens', 'Dinosaurs'];
-                const deck1 = buildFactionDeck(playerFactions[0]);
-                const deck2 = buildFactionDeck(playerFactions[1]);
+function executePlayCardAction({ room, roomId, actorId, action, actorTransport }) {
+    const validation = validatePlayCardAction(room, actorId, action);
+    if (!validation.ok) return validation;
 
-                const combinedDeck = [...deck1, ...deck2];
-                shuffleDeck(combinedDeck);
+    const { actor, actorEvents } = createActionActor(actorId, actorTransport);
+    const {
+        card,
+        cardIndex,
+        extraMinionPlayIndex,
+        fromDiscard,
+        player,
+        sourcePile,
+        targetBase,
+        targetMinion
+    } = validation;
 
-                player.factions = playerFactions;
-                player.hand = combinedDeck.splice(0, 5);
-                player.deck = combinedDeck;
-                player.discardPile = [];
-                player.vp = 0;
-            });
+    sourcePile.splice(cardIndex, 1);
+    const playedCard = { ...card, ownerName: player.name, ownerId: player.id };
+    let logMessage = '';
+    let targetName = null;
 
-            const firstPlayer = room.players[0];
-            room.currentTurnPlayerId = firstPlayer.id;
-            room.turnState = createInitialTurnState();
-            room.pendingAbility = null;
-            room.temporaryEffects = [];
+    if (card.discard === 'yes' && card.subtype === 'neither') {
+        player.discardPile.push(playedCard);
+        logMessage = `**${player.name}** plays **${card.name}**`;
+    } else if (card.subtype === 'base') {
+        if (!targetBase.playedCards) targetBase.playedCards = [];
+        targetBase.playedCards.push(playedCard);
+        targetName = targetBase.name;
+        logMessage = `**${player.name}** plays **${card.name}** on **${targetBase.name}**`;
+    } else if (['ally-minion', 'enemy-minion', 'neutral-minion'].includes(card.subtype)) {
+        if (!targetMinion.attachedCards) targetMinion.attachedCards = [];
+        targetMinion.attachedCards.push(playedCard);
+        targetName = targetMinion.name;
+        logMessage = `**${player.name}** plays **${card.name}** on **${targetMinion.name}**`;
+    } else {
+        player.discardPile.push(playedCard);
+        logMessage = `**${player.name}** plays **${card.name}**`;
+    }
 
-            // Add turn start log entry for the first player
-            if (!room.battleLog) room.battleLog = [];
-            room.battleLog.unshift(`**${firstPlayer.name}**'s turn`);
+    if (card.type === 'minion') {
+        if (extraMinionPlayIndex >= 0) room.turnState.extraMinionPlays.splice(extraMinionPlayIndex, 1);
+        else room.turnState.minionPlayed = true;
+        room.turnState.minionsPlayed += 1;
+        if (fromDiscard) room.turnState.ongoingDiscardMinionPlayed = true;
+    } else {
+        if (room.turnState.actionPlayed) room.turnState.extraActionPlays -= 1;
+        room.turnState.actionPlayed = true;
+        room.turnState.actionsPlayed += 1;
+    }
 
-            io.to(roomId).emit('game-started', {
+    addBattleLog(room, {
+        message: logMessage,
+        card: playedCard,
+        playerName: player.name,
+        targetName,
+        targetCard: targetMinion
+    });
+
+    recalculateOngoingEffects(room);
+    resolveOnPlayBoardEffects({
+        room,
+        roomId,
+        socket: actor,
+        playedCard,
+        targetBase,
+        targetMinion
+    });
+    recalculateOngoingEffects(room);
+    if (card.type === 'minion' && targetBase) {
+        queueAfterMinionPlayedBaseAbilities(room, targetBase, playedCard);
+    }
+
+    return {
+        ok: true,
+        actorEvents,
+        pendingAbility: room.pendingAbility || null,
+        playedCard
+    };
+}
+
+function validateResolveAbilityChoiceAction(room, actorId) {
+    if (!room) return failGameAction('room_not_found', 'Room not found.');
+    if (!room.pendingAbility) {
+        return failGameAction('no_pending_ability', 'There is no ability choice to resolve.');
+    }
+    if (room.pendingAbility.playerId !== actorId) {
+        return failGameAction('not_ability_controller', 'This ability choice belongs to another player.');
+    }
+    if (typeof room.pendingAbility.type !== 'string') {
+        return failGameAction('invalid_pending_ability', 'The pending ability cannot be resolved.');
+    }
+
+    return { ok: true, pendingAbility: room.pendingAbility };
+}
+
+function executeResolveAbilityChoiceAction({ room, roomId, actorId, action, actorTransport }) {
+    const validation = validateResolveAbilityChoiceAction(room, actorId);
+    if (!validation.ok) return validation;
+
+    const { actor, actorEvents } = createActionActor(actorId, actorTransport);
+    const { choice } = action;
+    const { continuation, type } = validation.pendingAbility;
+    const success = () => ({
+        ok: true,
+        actorEvents,
+        pendingAbility: room.pendingAbility || null
+    });
+    const resumeAndSucceed = () => {
+        resumeOnPlayContinuation(room, roomId, actor, continuation);
+        return success();
+    };
+
+    if (type.startsWith('triggered')) {
+        if (!resolveTriggeredAbilityChoice(room, roomId, actor, choice)) {
+            return failGameAction(
+                'invalid_triggered_ability_choice',
+                'That is no longer a valid triggered ability choice.'
+            );
+        }
+        return success();
+    }
+
+    if (type === 'confirmation') {
+        if (choice?.choiceId === 'accept') {
+            resolveBoardEffect({ room, roomId, socket: actor, effect: room.pendingAbility.effect, optional: false });
+        } else if (choice?.choiceId !== 'skip') {
+            return failGameAction('invalid_ability_choice', 'That is no longer a valid ability choice.');
+        }
+
+        room.pendingAbility = null;
+        return resumeAndSucceed();
+    }
+
+    const choiceHandlers = {
+        moveDestination: {
+            resolve: () => resolveMoveDestination(room, actor, choice),
+            code: 'invalid_move_destination',
+            error: 'That base is no longer a valid destination.'
+        },
+        moveTarget: {
+            resolve: () => resolveMoveTarget(room, roomId, actor, choice),
+            code: 'invalid_move_target',
+            error: 'That minion is no longer a valid move target.'
+        },
+        moveTargetBatch: {
+            resolve: () => resolveMoveTargetBatch(room, roomId, actor, choice),
+            code: 'invalid_move_target_batch',
+            error: 'One or more selected minions are no longer valid move targets.'
+        },
+        discardToHand: {
+            resolve: () => resolveDiscardToHand(room, actor, choice),
+            code: 'invalid_discard_target',
+            error: 'That card is no longer a valid discard-pile target.'
+        },
+        topDeckReveal: {
+            resolve: () => resolveTopDeckReveal(room, actor, choice),
+            code: 'invalid_reveal_choice',
+            error: 'That is no longer a valid reveal choice.'
+        },
+        multiZoneSelection: {
+            resolve: () => resolveMultiZoneSelection(room, roomId, actor, choice),
+            code: 'invalid_multi_zone_selection',
+            error: 'That card is no longer a valid selection.'
+        },
+        deckReorder: {
+            resolve: () => resolveDeckReorder(room, actor, choice),
+            code: 'invalid_deck_order',
+            error: 'That card order is no longer valid.'
+        },
+        discardPlayCard: {
+            resolve: () => resolveDiscardPlayCard(room, roomId, actor, choice),
+            code: 'invalid_discard_play',
+            error: 'That minion is no longer a valid discard-pile play.'
+        },
+        discardPlayEach: {
+            resolve: () => resolveDiscardPlayCard(room, roomId, actor, choice),
+            code: 'invalid_discard_play',
+            error: 'That minion is no longer a valid discard-pile play.'
+        },
+        discardPlayBase: {
+            resolve: () => resolveDiscardPlayBase(room, actor, choice),
+            code: 'invalid_discard_play_base',
+            error: 'That base is no longer a valid destination.'
+        },
+        playerHandReveal: {
+            resolve: () => resolvePlayerHandReveal(room, actor, choice, continuation),
+            code: 'invalid_player_target',
+            error: 'That player is no longer a valid target.'
+        },
+        handDiscard: {
+            resolve: () => resolveHandDiscard(room, actor, choice),
+            code: 'invalid_hand_card',
+            error: 'That hand card is no longer a valid target.'
+        },
+        baseDeckSwap: {
+            resolve: () => resolveBaseDeckSwap(room, choice, continuation),
+            code: 'invalid_base_replacement',
+            error: 'That base is no longer a valid replacement.'
+        },
+        massEnchantment: {
+            resolve: () => resolveMassEnchantment(room, actor, choice),
+            code: 'invalid_revealed_action',
+            error: 'That revealed action is no longer available.'
+        },
+        deckNameSelection: {
+            resolve: () => resolveDeckNameSelection(room, roomId, actor, choice),
+            code: 'invalid_card_name',
+            error: 'That card name is no longer available.'
+        },
+        attachedActionSelection: {
+            resolve: () => resolveAttachedActionSelection(room, roomId, actor, choice),
+            code: 'invalid_attached_action',
+            error: 'That attached action is no longer available.'
+        },
+        seaDogsFaction: {
+            resolve: () => resolveSeaDogsFaction(room, roomId, actor, choice),
+            code: 'invalid_faction_target',
+            error: 'That faction is no longer a valid target.'
+        },
+        seaDogsDestination: {
+            resolve: () => resolveSeaDogsDestination(room, actor, choice),
+            code: 'invalid_sea_dogs_destination',
+            error: 'That destination is no longer valid.'
+        },
+        disguiseSelection: {
+            resolve: () => resolveDisguiseSelection(room, roomId, actor, choice),
+            code: 'invalid_disguise_target',
+            error: 'That minion is no longer a valid Disguise target.',
+            resume: false
+        },
+        selectedPlayerBoardEffect: {
+            resolve: () => resolveSelectedPlayerBoardEffect(room, roomId, actor, choice),
+            code: 'invalid_player_ability_target',
+            error: 'That player is no longer a valid ability target.'
+        },
+        selectedPlayerBoardEffectBase: {
+            resolve: () => resolveSelectedPlayerBoardEffectBase(room, actor, choice),
+            code: 'invalid_base_ability_target',
+            error: 'That base is no longer a valid ability target.'
+        },
+        boardEffect: {
+            resolve: () => resolvePendingBoardEffect(room, actor, choice),
+            code: 'invalid_ability_target',
+            error: 'That is no longer a valid ability target.'
+        },
+        boardEffectBatch: {
+            resolve: () => resolveBoardEffectBatch(room, actor, choice),
+            code: 'invalid_ability_target_batch',
+            error: 'One or more selected minions are no longer valid targets.'
+        }
+    };
+    const handler = choiceHandlers[type];
+
+    if (handler) {
+        if (!handler.resolve()) return failGameAction(handler.code, handler.error);
+        return handler.resume === false ? success() : resumeAndSucceed();
+    }
+
+    if (!resolvePendingDinosaurAbility(room, roomId, actor, choice)) {
+        return failGameAction('invalid_ability_target', 'That is no longer a valid ability target.');
+    }
+
+    return resumeAndSucceed();
+}
+
+function validateUseTalentAction(room, actorId) {
+    if (!room) return failGameAction('room_not_found', 'Room not found.');
+    if (room.gamePhase !== 'playing') {
+        return failGameAction('invalid_phase', 'Talents can only be used during the playing phase.');
+    }
+    if (room.currentTurnPlayerId !== actorId) {
+        return failGameAction('not_your_turn', "It's not your turn!");
+    }
+    if (room.pendingAbility) {
+        return failGameAction('pending_ability', 'Resolve the pending ability before using a Talent.');
+    }
+    if (room.turnState.extraMinionPlays.some(permission => permission.required)) {
+        return failGameAction('required_extra_minion', "Play the Talent's required extra minion first.");
+    }
+    if (!room.players.some(player => player.id === actorId)) {
+        return failGameAction('player_not_found', 'Player not found in this room.');
+    }
+
+    return { ok: true };
+}
+
+function executeUseTalentAction({ room, actorId, action }) {
+    const validation = validateUseTalentAction(room, actorId);
+    if (!validation.ok) return validation;
+
+    const result = activateTalent(room, actorId, action.cardInstanceId);
+    if (!result.ok) return failGameAction('talent_unavailable', result.error);
+
+    return { ok: true, cardInstanceId: action.cardInstanceId };
+}
+
+function validateDraftFactionAction(room, actorId, action) {
+    if (!room) return failGameAction('room_not_found', 'Room not found.');
+    if (room.gamePhase !== 'drafting') {
+        return failGameAction('invalid_phase', 'Factions can only be selected during the draft.');
+    }
+
+    const draft = room.draftState;
+    if (!draft || !Array.isArray(draft.draftOrder) || !Array.isArray(draft.availableFactions)) {
+        return failGameAction('invalid_draft_state', 'The faction draft is not available.');
+    }
+
+    const currentPickerId = draft.draftOrder[draft.currentTurnIndex];
+    if (actorId !== currentPickerId) {
+        return failGameAction('not_your_draft_turn', 'It is not your turn to draft!');
+    }
+    if (!draft.availableFactions.includes(action.factionName)) {
+        return failGameAction('faction_unavailable', 'That faction is already taken!');
+    }
+    if (!Array.isArray(draft.picks?.[actorId])) {
+        return failGameAction('invalid_draft_state', 'The faction draft is not available.');
+    }
+
+    return { ok: true, draft };
+}
+
+function finishFactionDraft(room, draft) {
+    room.gamePhase = 'playing';
+
+    const baseDeck = buildBaseDeck();
+    room.activeBases = baseDeck.splice(0, 3).map(base => ({
+        ...base,
+        playedCards: []
+    }));
+    room.baseDeck = baseDeck;
+
+    room.players.forEach(player => {
+        const playerFactions = draft.picks[player.id] || ['Aliens', 'Dinosaurs'];
+        const combinedDeck = [
+            ...buildFactionDeck(playerFactions[0]),
+            ...buildFactionDeck(playerFactions[1])
+        ];
+        shuffleDeck(combinedDeck);
+
+        player.factions = playerFactions;
+        player.hand = combinedDeck.splice(0, 5);
+        player.deck = combinedDeck;
+        player.discardPile = [];
+        player.vp = 0;
+    });
+
+    const firstPlayer = room.players[0];
+    room.currentTurnPlayerId = firstPlayer.id;
+    room.turnState = createInitialTurnState();
+    room.pendingAbility = null;
+    room.temporaryEffects = [];
+    addBattleLog(room, `**${firstPlayer.name}**'s turn`);
+}
+
+function executeDraftFactionAction({ room, actorId, action }) {
+    const validation = validateDraftFactionAction(room, actorId, action);
+    if (!validation.ok) return validation;
+
+    const { draft } = validation;
+    draft.availableFactions = draft.availableFactions
+        .filter(factionName => factionName !== action.factionName);
+    draft.picks[actorId].push(action.factionName);
+    draft.currentTurnIndex += 1;
+
+    if (draft.currentTurnIndex < draft.draftOrder.length) {
+        return {
+            ok: true,
+            draftComplete: false,
+            roomEvents: [{
+                event: 'draft-update',
+                payload: { draftState: sanitizeDraftState(draft) }
+            }],
+            suppressDefaultStateEmission: true
+        };
+    }
+
+    finishFactionDraft(room, draft);
+    return {
+        ok: true,
+        draftComplete: true,
+        roomEvents: [{
+            event: 'game-started',
+            payload: {
                 players: room.players,
                 activeBases: room.activeBases,
                 spectators: room.spectators || [],
@@ -749,255 +1031,728 @@ io.on('connection', (socket) => {
                 turnState: room.turnState,
                 gamePhase: room.gamePhase,
                 battleLog: room.battleLog
+            }
+        }],
+        suppressDefaultStateEmission: true
+    };
+}
+
+function validateEndTurnAction(room, actorId) {
+    if (!room) return failGameAction('room_not_found', 'Room not found.');
+    if (room.gamePhase !== 'playing') {
+        return failGameAction('invalid_phase', 'Turns can only end during the playing phase.');
+    }
+    if (room.pendingAbility) {
+        return failGameAction('pending_ability', 'Resolve the pending ability before ending your turn.');
+    }
+    if (room.turnState.extraMinionPlays.some(permission => permission.required)) {
+        return failGameAction(
+            'required_extra_minion',
+            "Play the Talent's required extra minion before ending your turn."
+        );
+    }
+    if (room.currentTurnPlayerId !== actorId) {
+        return failGameAction('not_your_turn', "It's not your turn!");
+    }
+
+    const player = room.players.find(candidate => candidate.id === actorId);
+    if (!player) return failGameAction('player_not_found', 'Player not found in this room.');
+    return { ok: true, player };
+}
+
+function cleanupDelayedDiscardCards(room) {
+    room.activeBases.forEach(base => {
+        base.playedCards = (base.playedCards || []).filter(card => {
+            if (card.type !== 'action' || card.discard !== 'yes') return true;
+            const owner = room.players.find(player => player.id === card.ownerId);
+            if (owner) {
+                if (!owner.discardPile) owner.discardPile = [];
+                owner.discardPile.push(card);
+            }
+            return false;
+        });
+
+        base.playedCards.forEach(card => {
+            if (card.type !== 'minion' || !card.attachedCards) return;
+            card.attachedCards = card.attachedCards.filter(attached => {
+                if (attached.type !== 'action' || attached.discard !== 'yes') return true;
+                const owner = room.players.find(player => player.id === attached.ownerId);
+                if (owner) {
+                    if (!owner.discardPile) owner.discardPile = [];
+                    owner.discardPile.push(attached);
+                }
+                return false;
             });
+        });
+    });
+}
 
+function drawEndTurnCards(player) {
+    for (let index = 0; index < 2; index += 1) {
+        if (player.deck.length > 0) player.hand.push(player.deck.shift());
+    }
+}
+
+function advanceToNextTurn(room, actorId) {
+    const currentPlayerIndex = room.players.findIndex(player => player.id === actorId);
+    const nextPlayerIndex = (currentPlayerIndex + 1) % room.players.length;
+    const nextPlayer = room.players[nextPlayerIndex];
+
+    room.currentTurnPlayerId = nextPlayer.id;
+    room.turnState = createInitialTurnState();
+    room.gamePhase = 'playing';
+    addBattleLog(room, `**${nextPlayer.name}**'s turn`);
+    resolveStartTurnActions(room, nextPlayer.id);
+    return nextPlayer;
+}
+
+function executeEndTurnAction({
+    room,
+    roomId,
+    actorId,
+    emitState,
+    scheduleAction = setTimeout,
+    roomStillExists = () => true
+}) {
+    const validation = validateEndTurnAction(room, actorId);
+    if (!validation.ok) return validation;
+    const { player } = validation;
+
+    resolveEndTurnActions(room);
+    if (processNextTriggeredAbility(room, roomId)) {
+        return {
+            ok: true,
+            pendingAbility: room.pendingAbility,
+            turnCompleted: false
+        };
+    }
+
+    const scoringBases = getScoringBases(room);
+    if (scoringBases.length > 0) {
+        scoringBases.forEach(baseIndex => {
+            addBattleLog(room, `**${room.activeBases[baseIndex].name}** is scoring!`);
+        });
+        addBattleLog(room, `**${player.name}** has ended their turn`);
+        room.gamePhase = 'scoring';
+
+        const roomEvents = [{
+            event: 'game-state-update',
+            payload: {
+                players: room.players,
+                activeBases: room.activeBases,
+                currentTurnPlayerId: room.currentTurnPlayerId,
+                turnState: room.turnState,
+                gamePhase: room.gamePhase,
+                scoringBases,
+                battleLog: room.battleLog
+            }
+        }];
+
+        scheduleAction(() => {
+            if (!roomStillExists()) return;
+
+            const finishScoringTurn = () => {
+                drawEndTurnCards(player);
+                cleanupDelayedDiscardCards(room);
+                clearTemporaryEffects(room);
+                advanceToNextTurn(room, actorId);
+            };
+            const scoreEligibleBases = () => {
+                scoringBases.forEach(baseIndex => scoreBase(room, baseIndex));
+                room.afterTriggeredAbilitiesResolved = finishScoringTurn;
+                if (!processNextTriggeredAbility(room, roomId)) finishAfterTriggeredAbilities(room);
+            };
+
+            room.afterTriggeredAbilitiesResolved = scoreEligibleBases;
+            queueBeforeBaseScoringSpecials(room, scoringBases);
+            if (!processNextTriggeredAbility(room, roomId)) finishAfterTriggeredAbilities(room);
+            if (emitState) emitState(roomId, room);
+        }, 5000);
+
+        return {
+            ok: true,
+            roomEvents,
+            scoringBases,
+            suppressDefaultStateEmission: true,
+            turnCompleted: false
+        };
+    }
+
+    drawEndTurnCards(player);
+    addBattleLog(room, `**${player.name}** has ended their turn`);
+    cleanupDelayedDiscardCards(room);
+    clearTemporaryEffects(room);
+    const nextPlayer = advanceToNextTurn(room, actorId);
+
+    return {
+        ok: true,
+        nextPlayerId: nextPlayer.id,
+        turnCompleted: true
+    };
+}
+
+function executeGameAction({
+    room,
+    roomId,
+    actorId,
+    action,
+    actorTransport,
+    emitState,
+    emitRoomEvent,
+    scheduleAction,
+    roomStillExists
+}) {
+    if (!action || typeof action.type !== 'string') {
+        return failGameAction('invalid_action', 'A game action type is required.');
+    }
+
+    let result;
+    if (action.type === 'play-card') {
+        result = executePlayCardAction({ room, roomId, actorId, action, actorTransport });
+    } else if (action.type === 'resolve-ability-choice') {
+        result = executeResolveAbilityChoiceAction({ room, roomId, actorId, action, actorTransport });
+    } else if (action.type === 'use-talent') {
+        result = executeUseTalentAction({ room, actorId, action });
+    } else if (action.type === 'draft-faction') {
+        result = executeDraftFactionAction({ room, actorId, action });
+    } else if (action.type === 'end-turn') {
+        result = executeEndTurnAction({
+            room,
+            roomId,
+            actorId,
+            emitState,
+            scheduleAction,
+            roomStillExists
+        });
+    } else {
+        result = failGameAction('unsupported_action', `Unsupported game action: ${action.type}`);
+    }
+
+    if (result.ok) {
+        (result.roomEvents || []).forEach(({ event, payload }) => {
+            if (emitRoomEvent) emitRoomEvent(roomId, event, payload);
+        });
+        if (!result.suppressDefaultStateEmission && emitState) emitState(roomId, room);
+    }
+    return result;
+}
+
+function getLegalActions(room, actorId) {
+    const player = room?.players?.find(candidate => candidate.id === actorId);
+    if (!room || !player) return [];
+
+    if (room.pendingAbility) {
+        if (room.pendingAbility.playerId !== actorId) return [];
+        return getLegalAbilityChoiceActions(room, actorId);
+    }
+
+    if (room.gamePhase === 'drafting') {
+        return (room.draftState?.availableFactions || [])
+            .map(factionName => ({ type: 'draft-faction', factionName }))
+            .filter(action => validateDraftFactionAction(room, actorId, action).ok);
+    }
+
+    if (room.gamePhase !== 'playing') return [];
+
+    const legalActions = [
+        ...getLegalCardPlayActions(room, actorId, player.hand, false),
+        ...getLegalCardPlayActions(room, actorId, player.discardPile, true)
+    ];
+
+    if (validateUseTalentAction(room, actorId).ok) {
+        room.activeBases
+            .flatMap(getBaseMinions)
+            .filter(minion => minion.ownerId === actorId)
+            .forEach(minion => {
+                if (validateTalentActivation(room, actorId, minion.instanceId).ok) {
+                    legalActions.push({
+                        type: 'use-talent',
+                        cardInstanceId: minion.instanceId
+                    });
+                }
+            });
+    }
+
+    if (validateEndTurnAction(room, actorId).ok) legalActions.push({ type: 'end-turn' });
+    return legalActions;
+}
+
+function getLegalCardPlayActions(room, actorId, cards, fromDiscard) {
+    return (cards || []).flatMap(card => {
+        let candidates;
+        if (card.subtype === 'base') {
+            candidates = room.activeBases.map((base, baseIndex) => ({
+                type: 'play-card',
+                cardInstanceId: card.instanceId,
+                baseIndex,
+                fromDiscard
+            }));
+        } else if (['ally-minion', 'enemy-minion', 'neutral-minion'].includes(card.subtype)) {
+            candidates = room.activeBases.flatMap((base, baseIndex) => (
+                getBaseMinions(base).map(minion => ({
+                    type: 'play-card',
+                    cardInstanceId: card.instanceId,
+                    baseIndex,
+                    targetMinionInstanceId: minion.instanceId,
+                    fromDiscard
+                }))
+            ));
         } else {
-            io.to(roomId).emit('draft-update', { draftState: sanitizeDraftState(draft) });
+            candidates = [{
+                type: 'play-card',
+                cardInstanceId: card.instanceId,
+                fromDiscard
+            }];
         }
+
+        return candidates.filter(action => validatePlayCardAction(room, actorId, action).ok);
     });
+}
 
-    socket.on('resolve-ability-choice', ({ roomId, choice }) => {
-        const room = rooms[roomId];
-        if (!room || room.pendingAbility?.playerId !== socket.id) return;
-        const continuation = room.pendingAbility.continuation;
+function createAbilityChoiceAction(choice) {
+    return { type: 'resolve-ability-choice', choice };
+}
 
-        if (room.pendingAbility.type.startsWith('triggered')) {
-            if (!resolveTriggeredAbilityChoice(room, roomId, socket, choice)) {
-                return socket.emit('error', 'That is no longer a valid triggered ability choice.');
-            }
-            emitGameState(roomId, room);
+function createPermutationActions(candidateIds) {
+    const uniqueIds = [...new Set(candidateIds || [])];
+    const permutations = [];
+    const visit = (remaining, ordered) => {
+        if (remaining.length === 0) {
+            permutations.push(createAbilityChoiceAction({ cardInstanceIds: ordered }));
             return;
         }
+        remaining.forEach((candidateId, index) => {
+            visit(
+                [...remaining.slice(0, index), ...remaining.slice(index + 1)],
+                [...ordered, candidateId]
+            );
+        });
+    };
+    visit(uniqueIds, []);
+    return permutations;
+}
 
-        if (room.pendingAbility.type === 'confirmation') {
-            if (choice?.choiceId === 'accept') {
-                resolveBoardEffect({ room, roomId, socket, effect: room.pendingAbility.effect, optional: false });
-            } else if (choice?.choiceId !== 'skip') {
-                return socket.emit('error', 'That is no longer a valid ability choice.');
+function getLegalAbilityChoiceActions(room, actorId) {
+    const pending = room.pendingAbility;
+    const player = room.players.find(candidate => candidate.id === actorId);
+    const fromChoices = choices => choices.map(createAbilityChoiceAction);
+    const existingMinionIds = candidateIds => (candidateIds || []).filter(instanceId => (
+        Boolean(findMinionOnBoard(room, instanceId))
+    ));
+    const existingCardIds = (cards, candidateIds) => {
+        const allowedIds = new Set(candidateIds || []);
+        return (cards || []).filter(card => allowedIds.has(card.instanceId)).map(card => card.instanceId);
+    };
+
+    switch (pending.type) {
+        case 'confirmation':
+            return fromChoices([{ choiceId: 'accept' }, { choiceId: 'skip' }]);
+        case 'discardToHand': {
+            const actions = fromChoices(existingCardIds(player.discardPile, pending.candidateIds)
+                .map(cardInstanceId => ({ cardInstanceId })));
+            if (pending.canSkip) actions.push(createAbilityChoiceAction({ skip: true }));
+            return actions;
+        }
+        case 'playerHandReveal':
+            return fromChoices((pending.candidatePlayerIds || [])
+                .filter(playerId => room.players.some(candidate => candidate.id === playerId))
+                .map(playerId => ({ playerId })));
+        case 'handDiscard': {
+            const selectedPlayer = room.players.find(candidate => candidate.id === pending.selectedPlayerId);
+            return fromChoices(existingCardIds(selectedPlayer?.hand, pending.candidateIds)
+                .map(cardInstanceId => ({ cardInstanceId })));
+        }
+        case 'baseDeckSwap':
+            return fromChoices((pending.candidateBaseIds || [])
+                .filter(baseId => room.baseDeck?.some(base => base.id === baseId))
+                .map(baseInstanceId => ({ baseInstanceId })));
+        case 'attachedActionSelection': {
+            const minion = findMinionOnBoard(room, pending.targetMinionInstanceId);
+            return [
+                ...fromChoices(existingCardIds(minion?.attachedCards, pending.candidateIds)
+                    .map(cardInstanceId => ({ cardInstanceId }))),
+                createAbilityChoiceAction({ skip: true })
+            ];
+        }
+        case 'seaDogsFaction':
+            return fromChoices((pending.factions || []).map(faction => ({ faction })));
+        case 'seaDogsDestination': {
+            const sourceBase = room.activeBases[pending.sourceBaseIndex];
+            if (!sourceBase || isMovementPrevented(sourceBase, actorId)) return [];
+            return fromChoices((pending.candidateBaseIndices || [])
+                .filter(baseIndex => room.activeBases[baseIndex] && room.activeBases[baseIndex] !== sourceBase)
+                .map(baseIndex => ({ baseIndex })));
+        }
+        case 'disguiseSelection':
+            return [
+                ...fromChoices(existingMinionIds(pending.candidateIds)
+                    .map(minionInstanceId => ({ minionInstanceId }))),
+                createAbilityChoiceAction({ skip: true })
+            ];
+        case 'multiZoneSelection': {
+            const zoneCards = player[pending.zone] || [];
+            const candidateIds = existingCardIds(zoneCards, pending.candidateIds);
+            const actions = fromChoices(candidateIds.map(cardInstanceId => ({ cardInstanceId })));
+            if (pending.canSkip) actions.push(createAbilityChoiceAction({ skip: true }));
+            return actions;
+        }
+        case 'deckReorder': {
+            const cardIds = existingCardIds(player.deck, pending.cardIds);
+            if (cardIds.length !== pending.cardIds.length) return [];
+            return createPermutationActions(cardIds);
+        }
+        case 'discardPlayCard':
+        case 'discardPlayEach': {
+            const actions = fromChoices(existingCardIds(player.discardPile, pending.candidateIds)
+                .map(cardInstanceId => ({ cardInstanceId })));
+            if (pending.canSkip || pending.type === 'discardPlayEach') {
+                actions.push(createAbilityChoiceAction({ skip: true }));
+            }
+            return actions;
+        }
+        case 'discardPlayBase':
+            return fromChoices((pending.candidateBaseIndices || [])
+                .filter(baseIndex => Boolean(room.activeBases[baseIndex]))
+                .map(baseIndex => ({ baseIndex })));
+        case 'topDeckReveal': {
+            const choiceIds = pending.mode === 'discardOrReturn'
+                ? ['discard', 'return']
+                : pending.mode === 'actionToHandOrExtra'
+                    ? ['hand', 'playExtra']
+                    : ['playExtra', 'return'];
+            if (player.deck?.[0]?.instanceId !== pending.cardInstanceId) return [];
+            return fromChoices(choiceIds.map(choiceId => ({ choiceId })));
+        }
+        case 'massEnchantment': {
+            const actions = (pending.candidates || [])
+                .filter(candidate => room.players.find(owner => owner.id === candidate.playerId)
+                    ?.deck?.[0]?.instanceId === candidate.cardInstanceId)
+                .map(candidate => createAbilityChoiceAction({ cardInstanceId: candidate.cardInstanceId }));
+            actions.push(createAbilityChoiceAction({ skip: true }));
+            return actions;
+        }
+        case 'deckNameSelection':
+            return fromChoices(existingCardIds(player.deck, pending.candidateIds)
+                .map(cardInstanceId => ({ cardInstanceId })));
+        case 'selectedPlayerBoardEffect':
+            return fromChoices((pending.candidatePlayerIds || [])
+                .filter(playerId => room.players.some(candidate => candidate.id === playerId))
+                .map(playerId => ({ playerId })));
+        case 'selectedPlayerBoardEffectBase':
+            return fromChoices((pending.candidateBaseIndices || [])
+                .filter(baseIndex => Boolean(room.activeBases[baseIndex]))
+                .map(baseIndex => ({ baseIndex })));
+        case 'moveDestination': {
+            const sourceBase = room.activeBases[pending.sourceBaseIndex];
+            const minion = sourceBase && getBaseMinions(sourceBase)
+                .find(candidate => candidate.instanceId === pending.minionInstanceId);
+            if (!sourceBase || !minion || isMovementPrevented(sourceBase, actorId)) return [];
+            return fromChoices(room.activeBases
+                .map((base, baseIndex) => ({ base, baseIndex }))
+                .filter(({ base }) => base !== sourceBase)
+                .map(({ baseIndex }) => ({ baseIndex })));
+        }
+        case 'moveTarget': {
+            const actions = existingMinionIds(pending.candidateIds)
+                .filter(instanceId => {
+                    const sourceBase = getBaseForMinion(room, instanceId);
+                    return sourceBase && room.activeBases.length > 1
+                        && !isMovementPrevented(sourceBase, actorId);
+                })
+                .map(minionInstanceId => createAbilityChoiceAction({ minionInstanceId }));
+            actions.push(createAbilityChoiceAction({ skip: true }));
+            return actions;
+        }
+        case 'moveTargetBatch': {
+            const candidateIds = existingMinionIds(pending.candidateIds).filter(instanceId => (
+                !isMovementPrevented(getBaseForMinion(room, instanceId), actorId)
+            ));
+            const actions = fromChoices(candidateIds.map(minionInstanceId => ({ minionInstanceId })));
+            if ((pending.selectedIds || []).length > 0) {
+                actions.push(createAbilityChoiceAction({ finishSelection: true }));
+            } else {
+                actions.push(createAbilityChoiceAction({ cancel: true }));
+            }
+            return actions;
+        }
+        case 'boardEffect': {
+            const actions = fromChoices(existingMinionIds(pending.candidateIds)
+                .map(minionInstanceId => ({ minionInstanceId })));
+            if (pending.canSkip && pending.remainingSelections > 0) {
+                actions.push(createAbilityChoiceAction({ skip: true }));
+            }
+            return actions;
+        }
+        case 'boardEffectBatch': {
+            const actions = fromChoices(existingMinionIds(pending.candidateIds)
+                .map(minionInstanceId => ({ minionInstanceId })));
+            if ((pending.selectedIds || []).length > 0) {
+                actions.push(createAbilityChoiceAction({ finishSelection: true }));
+            } else {
+                actions.push(createAbilityChoiceAction({ cancel: true }));
+            }
+            return actions;
+        }
+        case 'naturalSelection': {
+            const base = room.activeBases[pending.baseIndex];
+            const sourceMinion = base && getBaseMinions(base)
+                .find(minion => minion.instanceId === pending.sourceMinionInstanceId);
+            if (!base || !sourceMinion) return [];
+            return fromChoices(getBaseMinions(base)
+                .filter(minion => pending.candidateIds.includes(minion.instanceId)
+                    && getCardPower(minion) < getCardPower(sourceMinion))
+                .map(minion => ({
+                    baseIndex: pending.baseIndex,
+                    minionInstanceId: minion.instanceId
+                })));
+        }
+        case 'survivalOfTheFittest': {
+            const nextChoice = pending.pendingChoices?.[0];
+            const base = room.activeBases[nextChoice?.baseIndex];
+            if (!base) return [];
+            return fromChoices(getBaseMinions(base)
+                .filter(minion => nextChoice.candidateIds.includes(minion.instanceId))
+                .map(minion => ({
+                    baseIndex: nextChoice.baseIndex,
+                    minionInstanceId: minion.instanceId
+                })));
+        }
+        case 'triggeredBeforeScoreShinobi':
+        case 'triggeredBeforeScoreHiddenNinja':
+        case 'triggeredBeforeScoreFullSail':
+        case 'triggeredBeforeScorePirateKing':
+        case 'triggeredBaseExtraPlay':
+        case 'triggeredAfterScoreScout':
+        case 'triggeredAfterScoreFirstMate':
+        case 'triggeredOptionalDraw':
+            return fromChoices([{ choiceId: 'accept' }, { choiceId: 'skip' }]);
+        case 'triggeredBeforeScoreHiddenNinjaMinion':
+            return fromChoices(existingCardIds(player.hand, pending.candidateIds)
+                .map(cardInstanceId => ({ cardInstanceId })));
+        case 'triggeredAfterScoreFirstMateDestination':
+        case 'triggeredBaseWinnerMoveDestination':
+            return fromChoices(room.activeBases
+                .map((base, baseIndex) => ({ base, baseIndex }))
+                .filter(({ base }) => pending.destinationBaseIds?.includes(base.id))
+                .map(({ baseIndex }) => ({ baseIndex })));
+        case 'triggeredBaseWinnerMoveMinion':
+            return [
+                ...fromChoices((pending.candidateMinions || [])
+                    .filter(minion => Boolean(getHeldScoredMinion(room, minion.instanceId)))
+                    .map(minion => ({ minionInstanceId: minion.instanceId }))),
+                createAbilityChoiceAction({ choiceId: 'skip' })
+            ];
+        case 'triggeredBuccaneer':
+            return [
+                ...fromChoices((pending.candidateBaseIndices || [])
+                    .filter(baseIndex => Boolean(room.activeBases[baseIndex]))
+                    .map(baseIndex => ({ baseIndex }))),
+                createAbilityChoiceAction({ choiceId: 'skip' })
+            ];
+        default:
+            return [];
+    }
+}
+
+function getBotDecisionActorId(room) {
+    if (!room) return null;
+
+    const pendingPlayerId = room.pendingAbility?.playerId;
+    if (pendingPlayerId) {
+        return room.players.some(player => player.id === pendingPlayerId && player.isBot === true)
+            ? pendingPlayerId
+            : null;
+    }
+
+    if (room.gamePhase === 'drafting') {
+        const currentPickerId = room.draftState?.draftOrder?.[room.draftState.currentTurnIndex];
+        return room.players.some(player => player.id === currentPickerId && player.isBot === true)
+            ? currentPickerId
+            : null;
+    }
+
+    if (room.gamePhase === 'playing') {
+        return room.players.some(player => (
+            player.id === room.currentTurnPlayerId && player.isBot === true
+        )) ? room.currentTurnPlayerId : null;
+    }
+
+    return null;
+}
+
+function chooseDefaultBotAction({ legalActions, room, random = Math.random }) {
+    if (room?.gamePhase === 'drafting') {
+        return legalActions[Math.floor(random() * legalActions.length)] || null;
+    }
+    return legalActions[0] || null;
+}
+
+function createBotTurnController({
+    getRoom,
+    getActions = getLegalActions,
+    executeAction,
+    chooseAction = chooseDefaultBotAction,
+    delayMs = BOT_ACTION_DELAY_MS,
+    maxConsecutiveActions = MAX_CONSECUTIVE_BOT_ACTIONS,
+    schedule = (callback, delay) => {
+        const timer = setTimeout(callback, delay);
+        timer.unref?.();
+        return timer;
+    },
+    clearSchedule = clearTimeout,
+    onAction = () => {},
+    onError = () => {}
+}) {
+    const roomStates = new Map();
+
+    const getControllerState = roomId => {
+        if (!roomStates.has(roomId)) {
+            roomStates.set(roomId, {
+                consecutiveActions: 0,
+                isScheduled: false,
+                lastActorId: null,
+                running: false,
+                timerHandle: null,
+                wakeRequested: false
+            });
+        }
+        return roomStates.get(roomId);
+    };
+
+    const reportError = (roomId, actorId, error) => {
+        const normalizedError = error instanceof Error ? error : new Error(String(error));
+        onError({ roomId, actorId, error: normalizedError });
+    };
+
+    const actionsMatch = (left, right) => JSON.stringify(left) === JSON.stringify(right);
+
+    const wake = roomId => {
+        const room = getRoom(roomId);
+        const actorId = getBotDecisionActorId(room);
+        const state = getControllerState(roomId);
+
+        if (!actorId) {
+            if (!state.running && !state.isScheduled) {
+                state.consecutiveActions = 0;
+                state.lastActorId = null;
+            }
+            return false;
+        }
+
+        if (state.running || state.isScheduled) {
+            state.wakeRequested = true;
+            return true;
+        }
+
+        state.isScheduled = true;
+        state.timerHandle = schedule(() => {
+            state.isScheduled = false;
+            state.timerHandle = null;
+            return runRoom(roomId);
+        }, delayMs);
+        return true;
+    };
+
+    const runRoom = async roomId => {
+        const state = getControllerState(roomId);
+        if (state.running) {
+            state.wakeRequested = true;
+            return { ok: false, reason: 'already_running' };
+        }
+
+        const room = getRoom(roomId);
+        const actorId = getBotDecisionActorId(room);
+        if (!room || !actorId) return { ok: false, reason: 'no_bot_decision' };
+
+        state.running = true;
+        state.wakeRequested = false;
+        let actionSucceeded = false;
+
+        try {
+            const legalActions = getActions(room, actorId);
+            if (legalActions.length === 0) {
+                throw new Error('No legal actions are available for this bot decision.');
             }
 
-            room.pendingAbility = null;
-            resumeOnPlayContinuation(room, roomId, socket, continuation);
-            emitGameState(roomId, room);
-            return;
-        }
+            const action = await chooseAction({ actorId, legalActions, room, roomId });
+            if (!action) throw new Error('The bot policy did not select an action.');
 
-        if (room.pendingAbility.type === 'moveDestination') {
-            if (!resolveMoveDestination(room, socket, choice)) {
-                return socket.emit('error', 'That base is no longer a valid destination.');
+            const currentRoom = getRoom(roomId);
+            const currentActorId = getBotDecisionActorId(currentRoom);
+            const currentLegalActions = currentActorId === actorId
+                ? getActions(currentRoom, actorId)
+                : [];
+            if (!currentLegalActions.some(legalAction => actionsMatch(legalAction, action))) {
+                throw new Error('The bot policy selected an action that is no longer legal.');
             }
 
-            resumeOnPlayContinuation(room, roomId, socket, continuation);
-            emitGameState(roomId, room);
-            return;
-        }
+            const result = await executeAction({
+                action,
+                actorId,
+                room: currentRoom,
+                roomId
+            });
+            if (!result?.ok) throw new Error(result?.error || 'The bot action was rejected.');
 
-        if (room.pendingAbility.type === 'moveTarget') {
-            if (!resolveMoveTarget(room, roomId, socket, choice)) {
-                return socket.emit('error', 'That minion is no longer a valid move target.');
+            if (state.lastActorId !== actorId) state.consecutiveActions = 0;
+            state.lastActorId = actorId;
+            state.consecutiveActions += 1;
+            actionSucceeded = true;
+            onAction({ action, actorId, result, roomId });
+            return { ok: true, action, actorId, result };
+        } catch (error) {
+            reportError(roomId, actorId, error);
+            return { ok: false, error, reason: 'action_failed' };
+        } finally {
+            state.running = false;
+            const shouldRecheck = actionSucceeded || state.wakeRequested;
+            state.wakeRequested = false;
+            if (shouldRecheck) {
+                const nextActorId = getBotDecisionActorId(getRoom(roomId));
+                if (!nextActorId) {
+                    state.consecutiveActions = 0;
+                    state.lastActorId = null;
+                } else {
+                    if (nextActorId !== state.lastActorId) state.consecutiveActions = 0;
+                    if (state.consecutiveActions < maxConsecutiveActions) {
+                        wake(roomId);
+                    } else {
+                        reportError(
+                            roomId,
+                            nextActorId,
+                            new Error(`Bot exceeded ${maxConsecutiveActions} consecutive actions.`)
+                        );
+                    }
+                }
             }
-
-            resumeOnPlayContinuation(room, roomId, socket, continuation);
-            emitGameState(roomId, room);
-            return;
         }
+    };
 
-        if (room.pendingAbility.type === 'moveTargetBatch') {
-            if (!resolveMoveTargetBatch(room, roomId, socket, choice)) {
-                return socket.emit('error', 'One or more selected minions are no longer valid move targets.');
-            }
-            resumeOnPlayContinuation(room, roomId, socket, continuation);
-            emitGameState(roomId, room);
-            return;
+    const runNow = roomId => {
+        const state = getControllerState(roomId);
+        if (state.isScheduled) {
+            clearSchedule(state.timerHandle);
+            state.isScheduled = false;
+            state.timerHandle = null;
         }
+        return runRoom(roomId);
+    };
 
-        if (room.pendingAbility.type === 'discardToHand') {
-            if (!resolveDiscardToHand(room, socket, choice)) {
-                return socket.emit('error', 'That card is no longer a valid discard-pile target.');
-            }
+    const stop = roomId => {
+        const state = roomStates.get(roomId);
+        if (!state) return false;
+        if (state.isScheduled) clearSchedule(state.timerHandle);
+        roomStates.delete(roomId);
+        return true;
+    };
 
-            resumeOnPlayContinuation(room, roomId, socket, continuation);
-            emitGameState(roomId, room);
-            return;
-        }
-
-        if (room.pendingAbility.type === 'topDeckReveal') {
-            if (!resolveTopDeckReveal(room, socket, choice)) {
-                return socket.emit('error', 'That is no longer a valid reveal choice.');
-            }
-
-            resumeOnPlayContinuation(room, roomId, socket, continuation);
-            emitGameState(roomId, room);
-            return;
-        }
-
-        if (room.pendingAbility.type === 'multiZoneSelection') {
-            if (!resolveMultiZoneSelection(room, roomId, socket, choice)) {
-                return socket.emit('error', 'That card is no longer a valid selection.');
-            }
-
-            resumeOnPlayContinuation(room, roomId, socket, continuation);
-            emitGameState(roomId, room);
-            return;
-        }
-
-        if (room.pendingAbility.type === 'deckReorder') {
-            if (!resolveDeckReorder(room, socket, choice)) {
-                return socket.emit('error', 'That card order is no longer valid.');
-            }
-
-            resumeOnPlayContinuation(room, roomId, socket, continuation);
-            emitGameState(roomId, room);
-            return;
-        }
-
-        if (room.pendingAbility.type === 'discardPlayCard' || room.pendingAbility.type === 'discardPlayEach') {
-            if (!resolveDiscardPlayCard(room, roomId, socket, choice)) {
-                return socket.emit('error', 'That minion is no longer a valid discard-pile play.');
-            }
-
-            resumeOnPlayContinuation(room, roomId, socket, continuation);
-            emitGameState(roomId, room);
-            return;
-        }
-
-        if (room.pendingAbility.type === 'discardPlayBase') {
-            if (!resolveDiscardPlayBase(room, socket, choice)) {
-                return socket.emit('error', 'That base is no longer a valid destination.');
-            }
-
-            resumeOnPlayContinuation(room, roomId, socket, continuation);
-            emitGameState(roomId, room);
-            return;
-        }
-
-        if (room.pendingAbility.type === 'playerHandReveal') {
-            if (!resolvePlayerHandReveal(room, socket, choice, continuation)) {
-                return socket.emit('error', 'That player is no longer a valid target.');
-            }
-            resumeOnPlayContinuation(room, roomId, socket, continuation);
-            emitGameState(roomId, room);
-            return;
-        }
-
-        if (room.pendingAbility.type === 'handDiscard') {
-            if (!resolveHandDiscard(room, socket, choice)) {
-                return socket.emit('error', 'That hand card is no longer a valid target.');
-            }
-            resumeOnPlayContinuation(room, roomId, socket, continuation);
-            emitGameState(roomId, room);
-            return;
-        }
-
-        if (room.pendingAbility.type === 'baseDeckSwap') {
-            if (!resolveBaseDeckSwap(room, choice, continuation)) {
-                return socket.emit('error', 'That base is no longer a valid replacement.');
-            }
-            resumeOnPlayContinuation(room, roomId, socket, continuation);
-            emitGameState(roomId, room);
-            return;
-        }
-
-        if (room.pendingAbility.type === 'massEnchantment') {
-            if (!resolveMassEnchantment(room, socket, choice)) {
-                return socket.emit('error', 'That revealed action is no longer available.');
-            }
-            resumeOnPlayContinuation(room, roomId, socket, continuation);
-            emitGameState(roomId, room);
-            return;
-        }
-
-        if (room.pendingAbility.type === 'deckNameSelection') {
-            if (!resolveDeckNameSelection(room, roomId, socket, choice)) {
-                return socket.emit('error', 'That card name is no longer available.');
-            }
-            resumeOnPlayContinuation(room, roomId, socket, continuation);
-            emitGameState(roomId, room);
-            return;
-        }
-
-        if (room.pendingAbility.type === 'attachedActionSelection') {
-            if (!resolveAttachedActionSelection(room, roomId, socket, choice)) {
-                return socket.emit('error', 'That attached action is no longer available.');
-            }
-            resumeOnPlayContinuation(room, roomId, socket, continuation);
-            emitGameState(roomId, room);
-            return;
-        }
-
-        if (room.pendingAbility.type === 'seaDogsFaction') {
-            if (!resolveSeaDogsFaction(room, roomId, socket, choice)) {
-                return socket.emit('error', 'That faction is no longer a valid target.');
-            }
-            resumeOnPlayContinuation(room, roomId, socket, continuation);
-            emitGameState(roomId, room);
-            return;
-        }
-
-        if (room.pendingAbility.type === 'seaDogsDestination') {
-            if (!resolveSeaDogsDestination(room, socket, choice)) {
-                return socket.emit('error', 'That destination is no longer valid.');
-            }
-            resumeOnPlayContinuation(room, roomId, socket, continuation);
-            emitGameState(roomId, room);
-            return;
-        }
-
-        if (room.pendingAbility.type === 'disguiseSelection') {
-            if (!resolveDisguiseSelection(room, roomId, socket, choice)) {
-                return socket.emit('error', 'That minion is no longer a valid Disguise target.');
-            }
-            emitGameState(roomId, room);
-            return;
-        }
-
-        if (room.pendingAbility.type === 'selectedPlayerBoardEffect') {
-            if (!resolveSelectedPlayerBoardEffect(room, roomId, socket, choice)) {
-                return socket.emit('error', 'That player is no longer a valid ability target.');
-            }
-
-            resumeOnPlayContinuation(room, roomId, socket, continuation);
-            emitGameState(roomId, room);
-            return;
-        }
-
-        if (room.pendingAbility.type === 'selectedPlayerBoardEffectBase') {
-            if (!resolveSelectedPlayerBoardEffectBase(room, socket, choice)) {
-                return socket.emit('error', 'That base is no longer a valid ability target.');
-            }
-
-            resumeOnPlayContinuation(room, roomId, socket, continuation);
-            emitGameState(roomId, room);
-            return;
-        }
-
-        if (room.pendingAbility.type === 'boardEffect') {
-            if (!resolvePendingBoardEffect(room, socket, choice)) {
-                return socket.emit('error', 'That is no longer a valid ability target.');
-            }
-
-            resumeOnPlayContinuation(room, roomId, socket, continuation);
-            emitGameState(roomId, room);
-            return;
-        }
-
-        if (room.pendingAbility.type === 'boardEffectBatch') {
-            if (!resolveBoardEffectBatch(room, socket, choice)) {
-                return socket.emit('error', 'One or more selected minions are no longer valid targets.');
-            }
-            resumeOnPlayContinuation(room, roomId, socket, continuation);
-            emitGameState(roomId, room);
-            return;
-        }
-
-        if (!resolvePendingDinosaurAbility(room, roomId, socket, choice)) {
-            return socket.emit('error', 'That is no longer a valid ability target.');
-        }
-
-        resumeOnPlayContinuation(room, roomId, socket, continuation);
-        emitGameState(roomId, room);
-    });
-});
+    return {
+        getStatus: roomId => ({ ...(roomStates.get(roomId) || {}) }),
+        runNow,
+        stop,
+        wake
+    };
+}
 
 function resolveOnPlayBoardEffects({ room, roomId, socket, playedCard, targetBase, targetMinion }) {
     if (playedCard.cardId === 'ninja_disguise_1') {
@@ -1586,6 +2341,7 @@ function queueDeckSearch(room, roomId, socket, effect) {
         zone: 'deck',
         candidateIds: candidates.map(card => card.instanceId),
         selectedIds: [],
+        minSelections: 1,
         maxSelections: 1,
         canSkip: false
     };
@@ -1628,6 +2384,7 @@ function queueMultiZoneSelection(room, roomId, socket, { action, candidates, mes
         zone,
         candidateIds: candidates.map(card => card.instanceId),
         selectedIds: [],
+        minSelections: 0,
         maxSelections: candidates.length,
         canSkip: true,
         message,
@@ -1667,7 +2424,9 @@ function resolveMultiZoneSelection(room, roomId, socket, choice) {
     if (Array.isArray(choice?.cardInstanceIds)) {
         const selectedIds = [...new Set(choice.cardInstanceIds)];
         const allValid = selectedIds.every(instanceId => pendingAbility.candidateIds.includes(instanceId));
-        if (!allValid || selectedIds.length > pendingAbility.maxSelections) return false;
+        if (!allValid
+            || selectedIds.length < (pendingAbility.minSelections || 0)
+            || selectedIds.length > pendingAbility.maxSelections) return false;
         pendingAbility.selectedIds = selectedIds;
         return executeMultiZoneSelection(room, roomId, socket, player, pendingAbility);
     }
@@ -2104,7 +2863,7 @@ function resolveSelectedPlayerBoardEffect(room, roomId, socket, choice) {
             selectedPlayerId: choice.playerId,
             candidateBaseIndices: eligibleBaseIndices
         };
-        socket.emit('ability-choice-required', {
+        emitActorEvent(socket, 'ability-choice-required', {
             roomId,
             message: `Choose the base where Broadside will affect ${room.players.find(player => player.id === choice.playerId)?.name || 'that player'}.`,
             choices: eligibleBaseIndices.map(baseIndex => ({
@@ -2222,6 +2981,7 @@ function queueMoveTargetBatch(room, roomId, socket, effect) {
         playerId: socket.id,
         effect,
         candidateIds: candidates.map(minion => minion.instanceId),
+        selectedIds: [],
         maxSelections: maximum
     };
     promptForMinionChoices(
@@ -2242,9 +3002,44 @@ function resolveMoveTargetBatch(room, roomId, socket, choice) {
         room.pendingAbility = null;
         return true;
     }
-    const selectedIds = [...new Set(choice?.minionInstanceIds || [])];
+
+    if (choice?.minionInstanceId) {
+        if (!pendingAbility.candidateIds.includes(choice.minionInstanceId)
+            || (pendingAbility.selectedIds || []).includes(choice.minionInstanceId)) {
+            return false;
+        }
+        if (!pendingAbility.selectedIds) pendingAbility.selectedIds = [];
+        pendingAbility.selectedIds.push(choice.minionInstanceId);
+        pendingAbility.candidateIds = pendingAbility.candidateIds
+            .filter(instanceId => instanceId !== choice.minionInstanceId);
+
+        if (pendingAbility.selectedIds.length < pendingAbility.maxSelections
+            && pendingAbility.candidateIds.length > 0) {
+            const remaining = pendingAbility.candidateIds
+                .map(findMinionOnBoard.bind(null, room))
+                .filter(Boolean);
+            promptForMinionChoices(
+                socket,
+                room,
+                roomId,
+                'Choose another minion to move, or finish selecting.',
+                remaining,
+                true
+            );
+            return true;
+        }
+    }
+
+    const selectedIds = choice?.finishSelection || choice?.skip
+        ? [...(pendingAbility.selectedIds || [])]
+        : choice?.minionInstanceId
+            ? [...(pendingAbility.selectedIds || [])]
+            : [...new Set(choice?.minionInstanceIds || [])];
     if (selectedIds.length > pendingAbility.maxSelections
-        || selectedIds.some(instanceId => !pendingAbility.candidateIds.includes(instanceId))) {
+        || selectedIds.some(instanceId => (
+            !(pendingAbility.selectedIds || []).includes(instanceId)
+            && !pendingAbility.candidateIds.includes(instanceId)
+        ))) {
         return false;
     }
     if (selectedIds.length === 0) {
@@ -2339,7 +3134,7 @@ function resolveMoveTarget(room, roomId, socket, choice) {
     return true;
 }
 
-function activateTalent(room, playerId, cardInstanceId) {
+function validateTalentActivation(room, playerId, cardInstanceId) {
     const minion = findMinionOnBoard(room, cardInstanceId);
     const base = getBaseForMinion(room, cardInstanceId);
     const talent = (minion?.abilities || []).find(ability => ability.trigger === 'talent');
@@ -2348,9 +3143,8 @@ function activateTalent(room, playerId, cardInstanceId) {
         return { ok: false, error: 'That Talent is no longer available.' };
     }
 
-    if (!room.turnState.talentUses) room.turnState.talentUses = {};
     const useKey = `${minion.instanceId}:talent`;
-    if (room.turnState.talentUses[useKey]) {
+    if (room.turnState.talentUses?.[useKey]) {
         return { ok: false, error: `${minion.name}'s Talent has already been used this turn.` };
     }
     if (!isAbilityConditionMet(talent, room.turnState)) {
@@ -2366,6 +3160,14 @@ function activateTalent(room, playerId, cardInstanceId) {
                 || (effect.cardType === 'minion' && effect.destination === 'sameBase')))
     ));
     if (!supported) return { ok: false, error: `${minion.name}'s Talent is not supported yet.` };
+
+    return { ok: true, base, effects, minion, talent, useKey };
+}
+
+function activateTalent(room, playerId, cardInstanceId) {
+    const validation = validateTalentActivation(room, playerId, cardInstanceId);
+    if (!validation.ok) return validation;
+    const { base, effects, minion, useKey } = validation;
 
     const baseIndex = room.activeBases.indexOf(base);
     effects.forEach(effect => {
@@ -2395,6 +3197,7 @@ function activateTalent(room, playerId, cardInstanceId) {
         }
     });
 
+    if (!room.turnState.talentUses) room.turnState.talentUses = {};
     room.turnState.talentUses[useKey] = true;
     const player = room.players.find(candidate => candidate.id === playerId);
     addBattleLog(room, `**${player?.name || 'A player'}** uses **${minion.name}**'s Talent.`);
@@ -2516,6 +3319,7 @@ function resolveMinionBoardEffect({ room, roomId, socket, effect, optional, sour
             playerId: socket.id,
             effect,
             candidateIds: eligibleTargets.map(candidate => candidate.instanceId),
+            selectedIds: [],
             maxSelections: target.quantity.max
         };
         promptForMinionChoices(
@@ -2568,9 +3372,43 @@ function resolveBoardEffectBatch(room, socket, choice) {
         return true;
     }
 
-    const selectedIds = [...new Set(choice?.minionInstanceIds || [])];
+    if (choice?.minionInstanceId) {
+        if (!pendingAbility.candidateIds.includes(choice.minionInstanceId)
+            || (pendingAbility.selectedIds || []).includes(choice.minionInstanceId)) {
+            return false;
+        }
+        if (!pendingAbility.selectedIds) pendingAbility.selectedIds = [];
+        pendingAbility.selectedIds.push(choice.minionInstanceId);
+        pendingAbility.candidateIds = pendingAbility.candidateIds
+            .filter(instanceId => instanceId !== choice.minionInstanceId);
+
+        if (pendingAbility.selectedIds.length < pendingAbility.maxSelections
+            && pendingAbility.candidateIds.length > 0) {
+            const remaining = pendingAbility.candidateIds
+                .map(findMinionOnBoard.bind(null, room))
+                .filter(Boolean);
+            promptForMinionChoices(
+                socket,
+                room,
+                null,
+                'Choose another minion, or finish selecting.',
+                remaining,
+                true
+            );
+            return true;
+        }
+    }
+
+    const selectedIds = choice?.finishSelection || choice?.skip
+        ? [...(pendingAbility.selectedIds || [])]
+        : choice?.minionInstanceId
+            ? [...(pendingAbility.selectedIds || [])]
+            : [...new Set(choice?.minionInstanceIds || [])];
     if (selectedIds.length > pendingAbility.maxSelections
-        || selectedIds.some(instanceId => !pendingAbility.candidateIds.includes(instanceId))) {
+        || selectedIds.some(instanceId => (
+            !(pendingAbility.selectedIds || []).includes(instanceId)
+            && !pendingAbility.candidateIds.includes(instanceId)
+        ))) {
         return false;
     }
 
@@ -3750,7 +4588,7 @@ function resolveTriggeredAbilityChoice(room, roomId, socket, choice) {
             scoringBaseName: pendingAbility.scoringBaseName,
             candidateIds: minions.map(card => card.instanceId)
         };
-        io.to(socket.id).emit('ability-choice-required', {
+        emitActorEvent(socket, 'ability-choice-required', {
             roomId,
             message: `Choose a minion to play on ${pendingAbility.scoringBaseName}.`,
             choices: minions.map(card => ({
@@ -3837,7 +4675,7 @@ function resolveTriggeredAbilityChoice(room, roomId, socket, choice) {
             ...pendingAbility,
             type: 'triggeredAfterScoreFirstMateDestination'
         };
-        io.to(socket.id).emit('ability-choice-required', {
+        emitActorEvent(socket, 'ability-choice-required', {
             roomId,
             message: `Choose where to move ${minion.name}.`,
             choices: destinations.map(({ base, baseIndex }) => ({
@@ -3886,7 +4724,7 @@ function resolveTriggeredAbilityChoice(room, roomId, socket, choice) {
             destinationBaseIds: pendingAbility.destinationBaseIds,
             sourceBaseName: pendingAbility.sourceBaseName
         };
-        io.to(socket.id).emit('ability-choice-required', {
+        emitActorEvent(socket, 'ability-choice-required', {
             roomId,
             message: `Choose where to move ${selectedMinion.name}.`,
             choices: destinations.map(({ base, baseIndex }) => ({
@@ -4008,6 +4846,7 @@ function emitGameState(roomId, room) {
         gamePhase: room.gamePhase,
         battleLog: room.battleLog
     });
+    botTurnController.wake(roomId);
 }
 
 function shuffleDeck(deck) {
@@ -4247,13 +5086,18 @@ function handlePlayerKick(roomId, playerId) {
     room.players = room.players.filter(p => p.id !== playerId);
     delete disconnectTimers[playerId];
 
-    if (room.players.length === 0) {
-        delete rooms[roomId];
+    if (!roomHasHumanPlayers(room)) {
+        io.to(roomId).emit('room-reset', { message: 'All human players have left. The room has been closed.' });
+        destroyRoom(roomId);
     } else {
         if (room.host === playerId) {
-            room.host = room.players[0].id;
+            room.host = getNextHumanHostId(room) || room.players[0].id;
         }
-        io.to(roomId).emit('update-players', { players: room.players, spectators: room.spectators || [] });
+        io.to(roomId).emit('update-players', {
+            players: room.players,
+            spectators: room.spectators || [],
+            host: room.host
+        });
     }
 }
 
@@ -4283,11 +5127,22 @@ if (require.main === module) {
 module.exports = {
     MAX_PLAYERS,
     activateTalent,
+    addLobbyBot,
     addLobbyParticipant,
     appendChatMessage,
     baseAbilitiesAreCancelled,
     clearTemporaryEffects,
+    chooseDefaultBotAction,
+    createBotTurnController,
     createInitialTurnState,
+    executeDraftFactionAction,
+    executeEndTurnAction,
+    executeGameAction,
+    executePlayCardAction,
+    executeResolveAbilityChoiceAction,
+    executeUseTalentAction,
+    getLegalActions,
+    getBotDecisionActorId,
     getOngoingDiscardPlayBaseIndices,
     isMinionPlayPrevented,
     isMinionProtectedFromCard,
@@ -4306,5 +5161,12 @@ module.exports = {
     resolveSelectedPlayerBoardEffectBase,
     resolveStartTurnActions,
     resolveTriggeredAbilityChoice,
-    scoreBase
+    roomHasHumanPlayers,
+    scoreBase,
+    validateDraftFactionAction,
+    validateEndTurnAction,
+    validatePlayCardAction,
+    validateResolveAbilityChoiceAction,
+    validateTalentActivation,
+    validateUseTalentAction
 };

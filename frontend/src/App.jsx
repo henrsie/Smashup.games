@@ -243,6 +243,7 @@ function App() {
   const [players, setPlayers] = useState([]);
   const [spectators, setSpectators] = useState([]);
   const [isHost, setIsHost] = useState(false);
+  const [hostId, setHostId] = useState(null);
   const [isSpectator, setIsSpectator] = useState(false);
 
   // Game state
@@ -273,6 +274,7 @@ function App() {
       setPlayers(players);
       setSpectators(spectators || []);
       setIsHost(host === socket.id);
+      setHostId(host);
       setIsSpectator(false);
     });
 
@@ -281,6 +283,7 @@ function App() {
       setPlayers(players);
       if (spectators) setSpectators(spectators);
       setIsHost(host === socket.id);
+      setHostId(host);
       setIsSpectator(role === 'spectator');
     });
 
@@ -314,8 +317,9 @@ function App() {
         setSpectators(spectators);
         setIsSpectator(spectators.some(spectator => spectator.id === socket.id));
       }
-      if (host) {
+      if (host !== undefined) {
         setIsHost(host === socket.id);
+        setHostId(host);
       }
     });
 
@@ -428,6 +432,7 @@ function App() {
     setPlayers([]);
     setSpectators([]);
     setIsHost(false);
+    setHostId(null);
     setIsSpectator(false);
     setGamePhase('lobby');
     setDraftState(null);
@@ -461,6 +466,10 @@ function App() {
 
   const handleStartGame = () => {
     socket.emit('start-game', { roomId: currentRoom });
+  };
+
+  const handleAddBot = () => {
+    socket.emit('add-bot', { roomId: currentRoom });
   };
 
   const handleDraftFaction = (factionName) => {
@@ -1770,9 +1779,10 @@ function App() {
           <h3>Players in Lobby:</h3>
           <ul>
             {players.map((p, index) => (
-              <li key={index}>
+              <li key={p.id || index}>
                 {p.name} {p.id === socket.id ? '(You)' : ''}
-                {index === 0 ? ' 👑 (Host)' : ''}
+                {p.isBot ? ' 🤖 (Bot)' : ''}
+                {p.id === hostId ? ' 👑 (Host)' : ''}
               </li>
             ))}
           </ul>
@@ -1792,6 +1802,14 @@ function App() {
 
           {isHost ? (
             <div style={{ marginTop: '20px' }}>
+              {players.length < 4 && (
+                <button
+                  onClick={handleAddBot}
+                  style={{ padding: '10px 20px', fontSize: '16px', backgroundColor: '#286090', color: 'white', cursor: 'pointer', marginRight: '10px' }}
+                >
+                  Add Bot
+                </button>
+              )}
               <button
                 onClick={handleStartGame}
                 style={{ padding: '10px 20px', fontSize: '16px', backgroundColor: 'green', color: 'white', cursor: 'pointer', marginRight: '10px' }}
