@@ -80,6 +80,161 @@ function BattleLogEntry({ entry, onCardClick }) {
   });
 }
 
+function GameRulesHelp() {
+  const [isOpen, setIsOpen] = useState(false);
+
+  useEffect(() => {
+    if (!isOpen) return undefined;
+    const closeOnEscape = (event) => {
+      if (event.key === 'Escape') setIsOpen(false);
+    };
+    window.addEventListener('keydown', closeOnEscape);
+    return () => window.removeEventListener('keydown', closeOnEscape);
+  }, [isOpen]);
+
+  return (
+    <>
+      <button
+        type="button"
+        aria-label="Open game rules"
+        title="Game rules"
+        onClick={() => setIsOpen(true)}
+        style={{
+          alignItems: 'center',
+          background: '#2c3e50',
+          border: '2px solid white',
+          borderRadius: '6px',
+          boxShadow: '0 2px 8px rgba(0,0,0,0.25)',
+          color: 'white',
+          cursor: 'pointer',
+          display: 'flex',
+          fontSize: '24px',
+          fontWeight: 'bold',
+          height: '42px',
+          justifyContent: 'center',
+          padding: 0,
+          position: 'fixed',
+          right: '18px',
+          top: '18px',
+          width: '42px',
+          zIndex: 1500
+        }}
+      >
+        ?
+      </button>
+
+      {isOpen && (
+        <div
+          role="presentation"
+          onClick={() => setIsOpen(false)}
+          style={{
+            alignItems: 'center',
+            background: 'rgba(0, 0, 0, 0.65)',
+            display: 'flex',
+            inset: 0,
+            justifyContent: 'center',
+            padding: '20px',
+            position: 'fixed',
+            zIndex: 5000
+          }}
+        >
+          <section
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="game-rules-title"
+            onClick={(event) => event.stopPropagation()}
+            style={{
+              background: 'white',
+              borderRadius: '10px',
+              boxShadow: '0 8px 30px rgba(0,0,0,0.35)',
+              boxSizing: 'border-box',
+              color: '#222',
+              maxHeight: '85vh',
+              maxWidth: '680px',
+              overflowY: 'auto',
+              padding: '28px',
+              width: '100%'
+            }}
+          >
+            <div style={{ alignItems: 'center', display: 'flex', gap: '16px', justifyContent: 'space-between' }}>
+              <h2 id="game-rules-title" style={{ margin: 0 }}>How to Play Smash Up</h2>
+              <button
+                type="button"
+                aria-label="Close game rules"
+                onClick={() => setIsOpen(false)}
+                style={{
+                  background: 'transparent',
+                  border: 'none',
+                  color: '#555',
+                  cursor: 'pointer',
+                  fontSize: '26px',
+                  lineHeight: 1,
+                  padding: '2px 6px'
+                }}
+              >
+                ×
+              </button>
+            </div>
+
+            <div style={{ fontSize: '14px', lineHeight: 1.55 }}>
+              <h3>Goal</h3>
+              <p>Earn victory points by helping bases score. Reach 15 VP; if the leaders are tied, continue until the tie is broken.</p>
+
+              <h3>Faction draft</h3>
+              <p>Up to four players draft two factions each. The draft moves through the player order, then reverses so everyone receives two picks.</p>
+
+              <h3>Your turn</h3>
+              <ol style={{ paddingLeft: '22px' }}>
+                <li>Play up to one minion and up to one action, in either order.</li>
+                <li>Resolve every required card or base ability choice.</li>
+                <li>Use each Talent no more than once during your turn.</li>
+                <li>End your turn. Bases at or above their breakpoint then score, and you draw two cards.</li>
+              </ol>
+
+              <h3>Playing cards</h3>
+              <p>Minions normally go on a base and contribute power there. Actions follow their card text and may be discarded immediately or remain attached to a base or minion.</p>
+
+              <h3>Scoring a base</h3>
+              <p>Compare each player&apos;s total minion power at that base. First, second, and third place receive the VP values printed on the base. Resolve scoring abilities, discard cards that do not remain in play, then reveal a replacement base.</p>
+
+              <h3>Ability timing</h3>
+              <ul style={{ paddingLeft: '22px' }}>
+                <li><strong>On play:</strong> resolves when the card is played.</li>
+                <li><strong>Ongoing:</strong> remains active while the card is in play.</li>
+                <li><strong>Talent:</strong> may be activated once on its controller&apos;s turn.</li>
+                <li><strong>Special:</strong> resolves at the time described by the card.</li>
+              </ul>
+
+              <p style={{ background: '#eef6fc', borderRadius: '6px', marginBottom: 0, padding: '12px' }}>
+                Click a card or a linked card name in the battle log to read its full text. When a choice window is open, resolve or skip it before continuing.
+              </p>
+            </div>
+
+            <button
+              type="button"
+              onClick={() => setIsOpen(false)}
+              style={{
+                background: '#007bff',
+                border: 'none',
+                borderRadius: '6px',
+                color: 'white',
+                cursor: 'pointer',
+                fontSize: '14px',
+                fontWeight: 'bold',
+                marginTop: '22px',
+                padding: '10px 18px',
+                width: '100%'
+              }}
+            >
+              Close Rules
+            </button>
+          </section>
+        </div>
+      )}
+    </>
+  );
+}
+
 function App() {
   // Room and lobby state
   const [playerName, setPlayerName] = useState('');
@@ -88,6 +243,7 @@ function App() {
   const [players, setPlayers] = useState([]);
   const [spectators, setSpectators] = useState([]);
   const [isHost, setIsHost] = useState(false);
+  const [isSpectator, setIsSpectator] = useState(false);
 
   // Game state
   const [gamePhase, setGamePhase] = useState('lobby');
@@ -112,51 +268,81 @@ function App() {
   const chatScrollRef = useRef(null);
 
   useEffect(() => {
-    socket.on('room-created', ({ roomId, players, host }) => {
+    socket.on('room-created', ({ roomId, players, spectators, host }) => {
       setCurrentRoom(roomId);
       setPlayers(players);
+      setSpectators(spectators || []);
       setIsHost(host === socket.id);
+      setIsSpectator(false);
     });
 
-    socket.on('room-joined', ({ roomId, players, spectators, host }) => {
+    socket.on('room-joined', ({ roomId, players, spectators, host, role }) => {
       setCurrentRoom(roomId);
       setPlayers(players);
       if (spectators) setSpectators(spectators);
       setIsHost(host === socket.id);
+      setIsSpectator(role === 'spectator');
     });
 
-    socket.on('spectate-started', ({ roomId, players, activeBases, spectators }) => {
+    socket.on('spectate-started', ({
+      roomId,
+      players,
+      activeBases,
+      spectators,
+      gamePhase,
+      draftState,
+      currentTurnPlayerId,
+      turnState,
+      battleLog
+    }) => {
       setCurrentRoom(roomId);
       setPlayers(players);
       if (activeBases) setActiveBases(activeBases);
       if (spectators) setSpectators(spectators);
-      setGamePhase('spectating');
+      if (draftState) setDraftState(draftState);
+      if (currentTurnPlayerId) setCurrentTurnPlayerId(currentTurnPlayerId);
+      if (turnState) setTurnState(turnState);
+      if (battleLog) setBattleLog(battleLog);
+      setIsHost(false);
+      setIsSpectator(true);
+      setGamePhase(gamePhase || 'playing');
     });
 
     socket.on('update-players', ({ players, spectators, host }) => {
       if (players) setPlayers(players);
-      if (spectators) setSpectators(spectators);
+      if (spectators) {
+        setSpectators(spectators);
+        setIsSpectator(spectators.some(spectator => spectator.id === socket.id));
+      }
       if (host) {
         setIsHost(host === socket.id);
       }
     });
 
-    socket.on('draft-started', ({ draftState, players, spectators }) => {
+    socket.on('draft-started', ({ roomId, draftState, players, spectators }) => {
+      if (roomId) setCurrentRoom(roomId);
       setGamePhase('drafting');
       setDraftState(draftState);
       setPlayers(players);
-      if (spectators) setSpectators(spectators);
+      if (spectators) {
+        setSpectators(spectators);
+        setIsSpectator(spectators.some(spectator => spectator.id === socket.id));
+      }
     });
 
     socket.on('draft-update', ({ draftState }) => {
       setDraftState(draftState);
     });
 
-    socket.on('game-started', ({ players, activeBases, spectators, currentTurnPlayerId, turnState, gamePhase, battleLog }) => {
+    socket.on('game-started', ({ roomId, players, activeBases, spectators, currentTurnPlayerId, turnState, gamePhase, battleLog }) => {
+      if (roomId) setCurrentRoom(roomId);
       setGamePhase(gamePhase || 'playing');
       setPlayers(players);
       if (activeBases) setActiveBases(activeBases);
-      if (spectators) setSpectators(spectators);
+      if (spectators) {
+        setSpectators(spectators);
+        setIsSpectator(spectators.some(spectator => spectator.id === socket.id));
+      }
       if (currentTurnPlayerId) setCurrentTurnPlayerId(currentTurnPlayerId);
       if (turnState) setTurnState(turnState);
       if (battleLog) setBattleLog(battleLog);
@@ -174,7 +360,10 @@ function App() {
       if (activeBases) setActiveBases(activeBases);
       if (currentTurnPlayerId) setCurrentTurnPlayerId(currentTurnPlayerId);
       if (turnState) setTurnState(turnState);
-      if (spectators) setSpectators(spectators);
+      if (spectators) {
+        setSpectators(spectators);
+        setIsSpectator(spectators.some(spectator => spectator.id === socket.id));
+      }
       if (battleLog) setBattleLog(battleLog);
 
       const me = players.find(p => p.id === socket.id);
@@ -239,6 +428,7 @@ function App() {
     setPlayers([]);
     setSpectators([]);
     setIsHost(false);
+    setIsSpectator(false);
     setGamePhase('lobby');
     setDraftState(null);
     setRoomIdInput('');
@@ -328,12 +518,13 @@ function App() {
   };
 
   // --- 1. SPECTATOR SCREEN ---
-  if (gamePhase === 'spectating') {
+  if (isSpectator && (gamePhase === 'playing' || gamePhase === 'scoring')) {
     return (
       <div style={{ padding: '30px', fontFamily: 'Arial, sans-serif' }}>
+        <GameRulesHelp />
         <h1>Smash Up - Spectator Mode 👀</h1>
         <h2>Room Code: <span style={{ color: 'blue' }}>{currentRoom}</span></h2>
-        <p><em>You joined after the game started. You are spectating live!</em></p>
+        <p><em>You are spectating this match live.</em></p>
 
         <div style={{ display: 'flex', gap: '30px' }}>
           <div style={{ flex: '1', background: '#f4f4f4', padding: '15px', borderRadius: '8px', minWidth: '240px' }}>
@@ -468,13 +659,20 @@ function App() {
 
     return (
       <div style={{ padding: '30px', fontFamily: 'Arial, sans-serif' }}>
+        <GameRulesHelp />
         <h1>Smash Up - Faction Draft Phase</h1>
         <h2>Room Code: <span style={{ color: 'blue' }}>{currentRoom}</span></h2>
 
         <div style={{ display: 'flex', gap: '30px' }}>
           <div style={{ flex: '3' }}>
             <div style={{ background: isMyTurn ? '#d4edda' : '#fff3cd', padding: '15px', borderRadius: '6px', marginBottom: '20px' }}>
-              <h3>{isMyTurn ? "👉 It's Your Turn to Pick a Faction!" : `⏳ Waiting for ${currentPicker?.name || 'someone'} to pick...`}</h3>
+              <h3>
+                {isSpectator
+                  ? `👀 Spectating — ${currentPicker?.name || 'a player'} is picking...`
+                  : isMyTurn
+                    ? "👉 It's Your Turn to Pick a Faction!"
+                    : `⏳ Waiting for ${currentPicker?.name || 'someone'} to pick...`}
+              </h3>
             </div>
 
             <h3>Available Factions:</h3>
@@ -573,6 +771,7 @@ function App() {
 
     return (
       <div style={{ padding: '30px', fontFamily: 'Arial, sans-serif' }}>
+        <GameRulesHelp />
         <h1>Smash Up - Match Active</h1>
         <h2>Room Code: <span style={{ color: 'blue' }}>{currentRoom}</span></h2>
 
@@ -1533,6 +1732,7 @@ function App() {
   // --- 4. LOBBY SCREEN ---
   return (
     <div style={{ padding: '40px', fontFamily: 'Arial, sans-serif' }}>
+      <GameRulesHelp />
       <h1>Smash Up Multiplayer Lobby</h1>
 
       {!currentRoom ? (
@@ -1577,6 +1777,19 @@ function App() {
             ))}
           </ul>
 
+          <h3>Spectators ({spectators.length}):</h3>
+          {spectators.length === 0 ? (
+            <p style={{ color: '#777', fontSize: '13px', fontStyle: 'italic' }}>No spectators</p>
+          ) : (
+            <ul>
+              {spectators.map((spectator) => (
+                <li key={spectator.id}>
+                  👁️ {spectator.name} {spectator.id === socket.id ? '(You)' : ''}
+                </li>
+              ))}
+            </ul>
+          )}
+
           {isHost ? (
             <div style={{ marginTop: '20px' }}>
               <button
@@ -1594,7 +1807,13 @@ function App() {
             </div>
           ) : (
             <div style={{ marginTop: '20px' }}>
-              <p><em>Waiting for the host to start the game...</em></p>
+              <p>
+                <em>
+                  {isSpectator
+                    ? 'This lobby already has four players. You will spectate the draft and match.'
+                    : 'Waiting for the host to start the game...'}
+                </em>
+              </p>
               <button
                 onClick={handleLeaveRoom}
                 style={{ padding: '8px 15px', backgroundColor: '#d9534f', color: 'white', cursor: 'pointer' }}

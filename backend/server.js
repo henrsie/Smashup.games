@@ -16,6 +16,7 @@ const allowedOrigins = (
 const SOCKET_CORS_OPTIONS = {
     origin: allowedOrigins
 };
+const MAX_PLAYERS = 4;
 const MAX_CHAT_HISTORY = 100;
 const MAX_CHAT_MESSAGE_LENGTH = 500;
 const createInitialTurnState = () => ({
@@ -56,6 +57,27 @@ const rooms = {};
 // Keep track of active disconnection timers: playerId -> NodeJS.Timeout
 const disconnectTimers = {};
 
+function addLobbyParticipant(room, participant) {
+    if (!room.spectators) room.spectators = [];
+
+    if (room.players.length >= MAX_PLAYERS) {
+        const spectator = { id: participant.id, name: participant.name };
+        room.spectators.push(spectator);
+        return { role: 'spectator', participant: spectator };
+    }
+
+    const player = {
+        id: participant.id,
+        name: participant.name,
+        hand: [],
+        deck: [],
+        discardPile: [],
+        online: true
+    };
+    room.players.push(player);
+    return { role: 'player', participant: player };
+}
+
 io.on('connection', (socket) => {
     console.log(`User connected: ${socket.id}`);
 
@@ -64,6 +86,7 @@ io.on('connection', (socket) => {
         rooms[roomId] = {
             host: socket.id,
             players: [{ id: socket.id, name: playerName, hand: [], deck: [], discardPile: [], online: true }],
+            spectators: [],
             gamePhase: 'lobby',
             pendingAbility: null,
             temporaryEffects: [],
@@ -71,7 +94,13 @@ io.on('connection', (socket) => {
         };
 
         socket.join(roomId);
-        socket.emit('room-created', { roomId, players: rooms[roomId].players, host: rooms[roomId].host });
+        socket.emit('room-created', {
+            roomId,
+            players: rooms[roomId].players,
+            spectators: rooms[roomId].spectators,
+            host: rooms[roomId].host,
+            role: 'player'
+        });
         socket.emit('chat-history', { messages: [] });
     });
     socket.on('join-room', ({ roomId, playerName }) => {
@@ -97,9 +126,23 @@ io.on('connection', (socket) => {
                 socket.emit('chat-history', { messages: room.chatMessages || [] });
 
                 if (room.gamePhase === 'drafting') {
-                    socket.emit('draft-started', { draftState: sanitizeDraftState(room.draftState), players: room.players, spectators: room.spectators || [] });
+                    socket.emit('draft-started', {
+                        roomId: formattedRoomId,
+                        draftState: sanitizeDraftState(room.draftState),
+                        players: room.players,
+                        spectators: room.spectators || []
+                    });
                 } else {
-                    socket.emit('game-started', { players: room.players, activeBases: room.activeBases, spectators: room.spectators || [], gamePhase: room.gamePhase });
+                    socket.emit('game-started', {
+                        roomId: formattedRoomId,
+                        players: room.players,
+                        activeBases: room.activeBases,
+                        spectators: room.spectators || [],
+                        currentTurnPlayerId: room.currentTurnPlayerId,
+                        turnState: room.turnState,
+                        gamePhase: room.gamePhase,
+                        battleLog: room.battleLog
+                    });
                 }
 
                 io.to(formattedRoomId).emit('update-players', { players: room.players, spectators: room.spectators || [], host: room.host });
@@ -118,20 +161,30 @@ io.on('connection', (socket) => {
                     roomId: formattedRoomId,
                     players: room.players,
                     activeBases: room.activeBases,
-                    spectators: room.spectators
+                    spectators: room.spectators,
+                    gamePhase: room.gamePhase,
+                    draftState: room.gamePhase === 'drafting' ? sanitizeDraftState(room.draftState) : null,
+                    currentTurnPlayerId: room.currentTurnPlayerId,
+                    turnState: room.turnState,
+                    battleLog: room.battleLog
                 });
 
-                io.to(formattedRoomId).emit('update-players', { players: room.players, spectators: room.spectators, host: socket.id });
+                io.to(formattedRoomId).emit('update-players', { players: room.players, spectators: room.spectators, host: room.host });
                 return;
             }
 
             // 3. Standard Lobby Join (Game hasn't started yet)
             socket.join(formattedRoomId);
             socket.emit('chat-history', { messages: room.chatMessages || [] });
-            const newPlayer = { id: socket.id, name: exactName, hand: [], deck: [], discardPile: [], online: true };
-            room.players.push(newPlayer);
+            const { role } = addLobbyParticipant(room, { id: socket.id, name: exactName });
 
-            socket.emit('room-joined', { roomId: formattedRoomId, players: room.players, spectators: room.spectators || [], host: room.host });
+            socket.emit('room-joined', {
+                roomId: formattedRoomId,
+                players: room.players,
+                spectators: room.spectators || [],
+                host: room.host,
+                role
+            });
             io.to(formattedRoomId).emit('update-players', { players: room.players, spectators: room.spectators || [], host: room.host });
 
         } else {
@@ -518,6 +571,18 @@ io.on('connection', (socket) => {
     socket.on('leave-room', ({ roomId }) => {
         if (roomId && rooms[roomId]) {
             const room = rooms[roomId];
+            const isSpectator = (room.spectators || []).some(spectator => spectator.id === socket.id);
+
+            if (isSpectator) {
+                room.spectators = room.spectators.filter(spectator => spectator.id !== socket.id);
+                socket.leave(roomId);
+                io.to(roomId).emit('update-players', {
+                    players: room.players,
+                    spectators: room.spectators,
+                    host: room.host
+                });
+                return;
+            }
 
             if (room.gamePhase === 'lobby') {
                 room.players = room.players.filter(p => p.id !== socket.id);
@@ -613,7 +678,8 @@ io.on('connection', (socket) => {
 
             io.to(roomId).emit('draft-started', {
                 draftState: sanitizeDraftState(room.draftState),
-                players: room.players
+                players: room.players,
+                spectators: room.spectators || []
             });
         } else {
             socket.emit('error', 'Only the host can start the game!');
@@ -678,6 +744,7 @@ io.on('connection', (socket) => {
             io.to(roomId).emit('game-started', {
                 players: room.players,
                 activeBases: room.activeBases,
+                spectators: room.spectators || [],
                 currentTurnPlayerId: room.currentTurnPlayerId,
                 turnState: room.turnState,
                 gamePhase: room.gamePhase,
@@ -3935,6 +4002,7 @@ function emitGameState(roomId, room) {
     io.to(roomId).emit('game-state-update', {
         players: room.players,
         activeBases: room.activeBases,
+        spectators: room.spectators || [],
         currentTurnPlayerId: room.currentTurnPlayerId,
         turnState: room.turnState,
         gamePhase: room.gamePhase,
@@ -4213,7 +4281,9 @@ if (require.main === module) {
 }
 
 module.exports = {
+    MAX_PLAYERS,
     activateTalent,
+    addLobbyParticipant,
     appendChatMessage,
     baseAbilitiesAreCancelled,
     clearTemporaryEffects,
