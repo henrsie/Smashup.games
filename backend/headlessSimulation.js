@@ -28,8 +28,19 @@ const DEFAULT_HEADLESS_PLAYER_COUNT = MAX_HEADLESS_PLAYER_COUNT;
 const DEFAULT_MAX_DECISIONS = 10_000;
 const DEFAULT_HEADLESS_POLICY_VERSION = BOT_POLICY_VERSIONS.RANDOM;
 
+function validatePolicyVersions(policyVersions, playerCount) {
+    if (policyVersions === undefined) return;
+    if (!Array.isArray(policyVersions) || policyVersions.length !== playerCount) {
+        throw new RangeError('policyVersions must contain exactly one entry per headless player.');
+    }
+    if (policyVersions.some(version => typeof version !== 'string' || version.trim().length === 0)) {
+        throw new TypeError('Every policyVersions entry must be a non-empty string.');
+    }
+}
+
 function createHeadlessRoom({
-    playerCount = DEFAULT_HEADLESS_PLAYER_COUNT,
+    policyVersions,
+    playerCount = policyVersions?.length ?? DEFAULT_HEADLESS_PLAYER_COUNT,
     randomSeed = generateRandomSeed(),
     policyVersion = DEFAULT_HEADLESS_POLICY_VERSION
 } = {}) {
@@ -39,6 +50,7 @@ function createHeadlessRoom({
             + `because ${Object.keys(factionsData).length} factions are available.`
         );
     }
+    validatePolicyVersions(policyVersions, playerCount);
 
     const players = Array.from({ length: playerCount }, (_, index) => ({
         id: `headless-bot-${index + 1}`,
@@ -49,7 +61,7 @@ function createHeadlessRoom({
         factions: [],
         isBot: true,
         online: true,
-        policyVersion,
+        policyVersion: policyVersions?.[index] || policyVersion,
         vp: 0
     }));
     const draftOrder = [...players, ...[...players].reverse()].map(player => player.id);
@@ -103,7 +115,8 @@ function validateHeadlessRoom(room) {
 
 class HeadlessSimulationEnvironment {
     constructor({
-        playerCount = DEFAULT_HEADLESS_PLAYER_COUNT,
+        policyVersions,
+        playerCount = policyVersions?.length ?? DEFAULT_HEADLESS_PLAYER_COUNT,
         randomSeed,
         policyVersion = DEFAULT_HEADLESS_POLICY_VERSION,
         maxDecisions = DEFAULT_MAX_DECISIONS,
@@ -111,6 +124,7 @@ class HeadlessSimulationEnvironment {
     } = {}) {
         this.defaultOptions = {
             playerCount,
+            policyVersions,
             randomSeed,
             policyVersion,
             maxDecisions,
@@ -131,6 +145,7 @@ class HeadlessSimulationEnvironment {
         room: suppliedRoom,
         roomId,
         playerCount = this.defaultOptions.playerCount,
+        policyVersions = this.defaultOptions.policyVersions,
         seed,
         randomSeed = seed ?? this.defaultOptions.randomSeed,
         policyVersion = this.defaultOptions.policyVersion,
@@ -141,8 +156,19 @@ class HeadlessSimulationEnvironment {
             throw new RangeError('maxDecisions must be a positive integer.');
         }
 
-        const room = suppliedRoom || createHeadlessRoom({ playerCount, randomSeed, policyVersion });
+        const room = suppliedRoom || createHeadlessRoom({
+            playerCount,
+            policyVersions,
+            randomSeed,
+            policyVersion
+        });
         validateHeadlessRoom(room);
+        if (suppliedRoom && policyVersions !== undefined) {
+            validatePolicyVersions(policyVersions, room.players.length);
+            room.players.forEach((player, index) => {
+                player.policyVersion = policyVersions[index];
+            });
+        }
         room.headless = true;
         room.botPolicyVersion ||= policyVersion;
         if (suppliedRoom) {
@@ -344,7 +370,8 @@ class HeadlessSimulationEnvironment {
 async function runHeadlessSimulation({
     room: suppliedRoom,
     roomId,
-    playerCount = DEFAULT_HEADLESS_PLAYER_COUNT,
+    policyVersions,
+    playerCount = policyVersions?.length ?? DEFAULT_HEADLESS_PLAYER_COUNT,
     randomSeed,
     policy,
     policies,
@@ -355,6 +382,7 @@ async function runHeadlessSimulation({
 } = {}) {
     const environment = new HeadlessSimulationEnvironment({
         playerCount,
+        policyVersions,
         randomSeed,
         policyVersion,
         maxDecisions,

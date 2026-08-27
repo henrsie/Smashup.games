@@ -5,6 +5,7 @@ const { Server } = require('socket.io');
 const { buildBaseDeck } = require('./bases.js');
 const { factionsData, buildFactionDeck } = require('./factions.js');
 const { getTriggeredEffects } = require('./abilityQueue.js');
+const { createBotMatchJobManager } = require('./botMatchRunner.js');
 const {
     BOT_POLICY_VERSIONS,
     chooseGreedyHeuristic1ActionIndex,
@@ -79,6 +80,7 @@ const io = new Server(server, {
 const rooms = {};
 // Keep track of active disconnection timers: playerId -> NodeJS.Timeout
 const disconnectTimers = {};
+const botMatchJobManager = createBotMatchJobManager();
 const botTurnController = createBotTurnController({
     getRoom: roomId => rooms[roomId],
     executeAction: ({ room, roomId, actorId, action }) => executeGameAction({
@@ -253,6 +255,20 @@ function generateRoomId() {
 
 io.on('connection', (socket) => {
     console.log(`User connected: ${socket.id}`);
+
+    socket.on('run-bot-match', async (payload = {}) => {
+        try {
+            const result = await botMatchJobManager.run(socket.id, payload);
+            if (socket.connected) socket.emit('bot-match-completed', result);
+        } catch (error) {
+            if (socket.connected) {
+                socket.emit('bot-match-failed', {
+                    code: error.code || 'bot_match_failed',
+                    error: error.message || 'The bot match could not be completed.'
+                });
+            }
+        }
+    });
 
     socket.on('create-room', ({ playerName, randomSeed } = {}) => {
         const roomId = generateRoomId();

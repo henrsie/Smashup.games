@@ -4,6 +4,7 @@ const {
     createHeadlessEnvironmentManager,
     getEnvironmentSummary
 } = require('./headlessEnvironmentServer.js');
+const { BOT_POLICY_VERSIONS } = require('./botPolicies.js');
 
 test('Python bridge manager exposes reset, validated index steps, results, and cleanup', () => {
     const manager = createHeadlessEnvironmentManager({ idFactory: () => 'test-environment' });
@@ -38,4 +39,20 @@ test('Python bridge manager exposes reset, validated index steps, results, and c
 
     assert.equal(manager.delete(created.environmentId), true);
     assert.equal(manager.get(created.environmentId), null);
+});
+
+test('Python bridge manager accepts per-player policy versions', () => {
+    const policyVersions = [
+        BOT_POLICY_VERSIONS.RANDOM,
+        BOT_POLICY_VERSIONS.GREEDY_HEURISTIC_1
+    ];
+    const manager = createHeadlessEnvironmentManager({ idFactory: () => 'mixed-policy-environment' });
+    const created = manager.create({ policyVersions, randomSeed: 321 });
+    const environment = manager.get(created.environmentId);
+
+    assert.equal(environment.room.players.length, 2);
+    assert.deepEqual(
+        environment.room.players.map(player => player.policyVersion),
+        policyVersions
+    );
 });

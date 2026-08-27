@@ -21,6 +21,12 @@ const BOT_POLICY_OPTIONS = [
   { value: 'greedy_heuristic_2', label: 'Greedy heuristic 2' }
 ];
 const BOT_POLICY_LABELS = Object.fromEntries(BOT_POLICY_OPTIONS.map(option => [option.value, option.label]));
+const BOT_POLICY_DESCRIPTIONS = {
+  'random-v1': 'Chooses randomly from every legal action.',
+  greedy_heuristic_1: 'Plays stronger minions toward the bases with the most power.',
+  greedy_heuristic_2: 'Plays stronger minions toward the bases with the least power.'
+};
+const DEFAULT_BOT_MODE_POLICIES = ['random-v1', 'greedy_heuristic_1'];
 const getPlayerDisplayName = player => (
   `${player.name}${player.isBot
     ? ` (${(BOT_POLICY_LABELS[player.policyVersion] || 'Random').toLowerCase()})`
@@ -246,6 +252,330 @@ function GameRulesHelp() {
   );
 }
 
+function BotModeSetup({
+  botCount,
+  error,
+  isRunning,
+  policyVersions,
+  onBack,
+  onBotCountChange,
+  onPolicyChange,
+  onRun
+}) {
+  return (
+    <main
+      style={{
+        background: 'linear-gradient(145deg, #eaf3fb 0%, #f8f4df 100%)',
+        boxSizing: 'border-box',
+        fontFamily: 'Arial, sans-serif',
+        minHeight: '100vh',
+        padding: '48px 20px'
+      }}
+    >
+      <GameRulesHelp />
+      <section
+        style={{
+          background: 'white',
+          border: '1px solid #d8e1e8',
+          borderRadius: '16px',
+          boxShadow: '0 14px 36px rgba(39, 63, 82, 0.14)',
+          margin: '0 auto',
+          maxWidth: '900px',
+          overflow: 'hidden'
+        }}
+      >
+        <header style={{ background: '#243b53', color: 'white', padding: '30px 32px' }}>
+          <div style={{ color: '#b9d9ee', fontSize: '13px', fontWeight: 'bold', letterSpacing: '1.4px', textTransform: 'uppercase' }}>
+            Bot exhibition
+          </div>
+          <h1 style={{ fontSize: '32px', margin: '7px 0 8px' }}>Bot Mode</h1>
+          <p style={{ color: '#dbe8f2', lineHeight: 1.5, margin: 0, maxWidth: '650px' }}>
+            Build a lineup of bots with your chosen strategies, then simulate their match and compare the final standings.
+          </p>
+        </header>
+
+        <div style={{ padding: '30px 32px 34px' }}>
+          <fieldset style={{ border: 0, margin: '0 0 28px', padding: 0 }}>
+            <legend style={{ color: '#243b53', fontSize: '18px', fontWeight: 'bold', marginBottom: '12px' }}>
+              Number of bots
+            </legend>
+            <div style={{ display: 'flex', gap: '10px' }}>
+              {[2, 3].map(count => (
+                <button
+                  key={count}
+                  type="button"
+                  aria-pressed={botCount === count}
+                  disabled={isRunning}
+                  onClick={() => onBotCountChange(count)}
+                  style={{
+                    background: botCount === count ? '#286090' : '#edf2f6',
+                    border: botCount === count ? '2px solid #286090' : '2px solid #ced9e2',
+                    borderRadius: '8px',
+                    color: botCount === count ? 'white' : '#334e68',
+                    cursor: isRunning ? 'not-allowed' : 'pointer',
+                    fontSize: '16px',
+                    fontWeight: 'bold',
+                    minWidth: '112px',
+                    padding: '11px 18px'
+                  }}
+                >
+                  {count} bots
+                </button>
+              ))}
+            </div>
+          </fieldset>
+
+          <div style={{ display: 'grid', gap: '16px', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))' }}>
+            {policyVersions.map((policyVersion, index) => (
+              <article
+                key={`bot-mode-seat-${index + 1}`}
+                style={{
+                  background: '#f7fafc',
+                  border: '1px solid #d8e1e8',
+                  borderRadius: '10px',
+                  padding: '20px'
+                }}
+              >
+                <div style={{ alignItems: 'center', display: 'flex', gap: '10px', marginBottom: '14px' }}>
+                  <span aria-hidden="true" style={{ fontSize: '26px' }}>🤖</span>
+                  <div>
+                    <div style={{ color: '#627d98', fontSize: '12px', fontWeight: 'bold', textTransform: 'uppercase' }}>
+                      Player seat {index + 1}
+                    </div>
+                    <strong style={{ color: '#243b53', fontSize: '18px' }}>bot{index + 1}</strong>
+                  </div>
+                </div>
+
+                <label
+                  htmlFor={`bot-mode-policy-${index}`}
+                  style={{ color: '#334e68', display: 'block', fontSize: '13px', fontWeight: 'bold', marginBottom: '7px' }}
+                >
+                  Strategy
+                </label>
+                <select
+                  id={`bot-mode-policy-${index}`}
+                  disabled={isRunning}
+                  value={policyVersion}
+                  onChange={(event) => onPolicyChange(index, event.target.value)}
+                  style={{
+                    background: 'white',
+                    border: '1px solid #9fb3c8',
+                    borderRadius: '6px',
+                    boxSizing: 'border-box',
+                    color: '#243b53',
+                    fontSize: '15px',
+                    padding: '10px',
+                    width: '100%'
+                  }}
+                >
+                  {BOT_POLICY_OPTIONS.map(option => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+                <p style={{ color: '#627d98', fontSize: '13px', lineHeight: 1.45, margin: '11px 0 0' }}>
+                  {BOT_POLICY_DESCRIPTIONS[policyVersion]}
+                </p>
+              </article>
+            ))}
+          </div>
+
+          <p
+            style={{
+              background: '#e8f4ec',
+              borderRadius: '7px',
+              color: '#28623b',
+              fontSize: '14px',
+              margin: '22px 0',
+              padding: '12px 14px'
+            }}
+          >
+            Ready: {botCount} bots selected. Strategies may be shared. Draft picks are chosen randomly (for now).
+          </p>
+
+          {error && (
+            <p
+              role="alert"
+              style={{
+                background: '#fbe9e9',
+                border: '1px solid #e5b8b8',
+                borderRadius: '7px',
+                color: '#8b2525',
+                fontSize: '14px',
+                margin: '0 0 22px',
+                padding: '12px 14px'
+              }}
+            >
+              {error}
+            </p>
+          )}
+
+          <div style={{ alignItems: 'center', display: 'flex', flexWrap: 'wrap', gap: '12px', justifyContent: 'space-between' }}>
+            <button
+              type="button"
+              disabled={isRunning}
+              onClick={onBack}
+              style={{
+                background: 'white',
+                border: '1px solid #9fb3c8',
+                borderRadius: '7px',
+                color: '#334e68',
+                cursor: isRunning ? 'not-allowed' : 'pointer',
+                opacity: isRunning ? 0.65 : 1,
+                fontSize: '15px',
+                fontWeight: 'bold',
+                padding: '11px 20px'
+              }}
+            >
+              Back to Lobby
+            </button>
+            <div style={{ textAlign: 'right' }}>
+              <button
+                type="button"
+                disabled={isRunning}
+                onClick={onRun}
+                style={{
+                  background: isRunning ? '#9fb3c8' : '#2f855a',
+                  border: 'none',
+                  borderRadius: '7px',
+                  color: 'white',
+                  cursor: isRunning ? 'wait' : 'pointer',
+                  fontSize: '16px',
+                  fontWeight: 'bold',
+                  padding: '12px 24px'
+                }}
+              >
+                {isRunning ? 'Running Match…' : 'Run Match'}
+              </button>
+              <div style={{ color: '#829ab1', fontSize: '12px', marginTop: '6px' }}>
+                {isRunning ? 'The bots are playing in an isolated worker.' : 'Results usually arrive in under a few seconds.'}
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+  );
+}
+
+function BotModeResult({ result, onBackToLobby, onChangeLineup, onRunAgain }) {
+  const standings = result.standings || result.gameResult?.standings || [];
+  const winnerId = result.gameResult?.winnerId;
+  const winnerName = result.gameResult?.winnerName;
+  const completedNormally = result.terminated && result.gameResult;
+
+  return (
+    <main
+      style={{
+        background: 'linear-gradient(145deg, #eaf3fb 0%, #f8f4df 100%)',
+        boxSizing: 'border-box',
+        fontFamily: 'Arial, sans-serif',
+        minHeight: '100vh',
+        padding: '48px 20px'
+      }}
+    >
+      <GameRulesHelp />
+      <section
+        style={{
+          background: 'white',
+          borderRadius: '16px',
+          boxShadow: '0 14px 36px rgba(39, 63, 82, 0.14)',
+          margin: '0 auto',
+          maxWidth: '760px',
+          overflow: 'hidden'
+        }}
+      >
+        <header style={{ background: completedNormally ? '#243b53' : '#6b4f24', color: 'white', padding: '30px 32px', textAlign: 'center' }}>
+          <div aria-hidden="true" style={{ fontSize: '52px' }}>{completedNormally ? '🏆' : '⏱️'}</div>
+          <h1 style={{ fontSize: '32px', margin: '8px 0' }}>
+            {completedNormally ? `${winnerName} wins!` : 'Simulation stopped'}
+          </h1>
+          <p style={{ color: '#dbe8f2', margin: 0 }}>
+            {completedNormally
+              ? `${result.gameResult.winningVictoryPoints} victory points`
+              : 'The match reached its simulation decision limit without a winner.'}
+          </p>
+        </header>
+
+        <div style={{ padding: '30px 32px 34px' }}>
+          <div style={{ display: 'grid', gap: '12px', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', marginBottom: '26px' }}>
+            <div style={{ background: '#f1f5f8', borderRadius: '8px', padding: '14px', textAlign: 'center' }}>
+              <div style={{ color: '#627d98', fontSize: '12px', fontWeight: 'bold', textTransform: 'uppercase' }}>Seed</div>
+              <strong style={{ color: '#243b53', display: 'block', marginTop: '5px' }}>{result.randomSeed}</strong>
+            </div>
+            <div style={{ background: '#f1f5f8', borderRadius: '8px', padding: '14px', textAlign: 'center' }}>
+              <div style={{ color: '#627d98', fontSize: '12px', fontWeight: 'bold', textTransform: 'uppercase' }}>Decisions</div>
+              <strong style={{ color: '#243b53', display: 'block', marginTop: '5px' }}>{result.decisionCount}</strong>
+            </div>
+            <div style={{ background: '#f1f5f8', borderRadius: '8px', padding: '14px', textAlign: 'center' }}>
+              <div style={{ color: '#627d98', fontSize: '12px', fontWeight: 'bold', textTransform: 'uppercase' }}>Bots</div>
+              <strong style={{ color: '#243b53', display: 'block', marginTop: '5px' }}>{standings.length}</strong>
+            </div>
+          </div>
+
+          <h2 style={{ borderBottom: '2px solid #d8e1e8', color: '#243b53', fontSize: '21px', margin: '0 0 14px', paddingBottom: '9px' }}>
+            Final Standings
+          </h2>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
+            {standings.map(standing => (
+              <article
+                key={standing.playerId}
+                style={{
+                  alignItems: 'center',
+                  background: standing.playerId === winnerId ? '#fff7d6' : '#f7fafc',
+                  border: standing.playerId === winnerId ? '2px solid #d9aa00' : '1px solid #d8e1e8',
+                  borderRadius: '9px',
+                  display: 'grid',
+                  gap: '14px',
+                  gridTemplateColumns: '48px 1fr auto',
+                  padding: '14px 16px'
+                }}
+              >
+                <strong style={{ color: '#486581', fontSize: '20px', textAlign: 'center' }}>#{standing.rank}</strong>
+                <div>
+                  <strong style={{ color: '#243b53' }}>🤖 {standing.name}</strong>
+                  <div style={{ color: '#486581', fontSize: '13px', marginTop: '4px' }}>
+                    {BOT_POLICY_LABELS[standing.policyVersion] || standing.policyVersion || 'Unknown strategy'}
+                  </div>
+                  <div style={{ color: '#829ab1', fontSize: '12px', marginTop: '3px' }}>
+                    {(standing.factions || []).join(' & ') || 'No factions'}
+                  </div>
+                </div>
+                <strong style={{ color: '#a33a2b', fontSize: '18px' }}>{standing.vp} VP</strong>
+              </article>
+            ))}
+          </div>
+
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: '10px', justifyContent: 'center', marginTop: '28px' }}>
+            <button
+              type="button"
+              onClick={onRunAgain}
+              style={{ background: '#2f855a', border: 0, borderRadius: '7px', color: 'white', cursor: 'pointer', fontSize: '15px', fontWeight: 'bold', padding: '11px 18px' }}
+            >
+              Run Same Lineup Again
+            </button>
+            <button
+              type="button"
+              onClick={onChangeLineup}
+              style={{ background: '#286090', border: 0, borderRadius: '7px', color: 'white', cursor: 'pointer', fontSize: '15px', fontWeight: 'bold', padding: '11px 18px' }}
+            >
+              Change Lineup
+            </button>
+            <button
+              type="button"
+              onClick={onBackToLobby}
+              style={{ background: 'white', border: '1px solid #9fb3c8', borderRadius: '7px', color: '#334e68', cursor: 'pointer', fontSize: '15px', fontWeight: 'bold', padding: '11px 18px' }}
+            >
+              Back to Lobby
+            </button>
+          </div>
+        </div>
+      </section>
+    </main>
+  );
+}
+
 function App() {
   // Room and lobby state
   const [playerName, setPlayerName] = useState('');
@@ -279,6 +609,11 @@ function App() {
   const [selectedAbilityChoiceIds, setSelectedAbilityChoiceIds] = useState([]);
   const [chatDraft, setChatDraft] = useState('');
   const [selectedBotPolicy, setSelectedBotPolicy] = useState('greedy_heuristic_1');
+  const [showBotModeSetup, setShowBotModeSetup] = useState(false);
+  const [botModePolicyVersions, setBotModePolicyVersions] = useState(DEFAULT_BOT_MODE_POLICIES);
+  const [botModeRunning, setBotModeRunning] = useState(false);
+  const [botModeResult, setBotModeResult] = useState(null);
+  const [botModeError, setBotModeError] = useState('');
   const chatScrollRef = useRef(null);
 
   useEffect(() => {
@@ -411,6 +746,25 @@ function App() {
       ));
     });
 
+    socket.on('bot-match-completed', (result) => {
+      setBotModeRunning(false);
+      setBotModeError('');
+      setBotModeResult(result);
+    });
+
+    socket.on('bot-match-failed', ({ error } = {}) => {
+      setBotModeRunning(false);
+      setBotModeError(error || 'The bot match could not be completed.');
+    });
+
+    const handleSocketDisconnect = () => {
+      setBotModeRunning(wasRunning => {
+        if (wasRunning) setBotModeError('The server connection was lost while the bots were playing.');
+        return false;
+      });
+    };
+    socket.on('disconnect', handleSocketDisconnect);
+
     socket.on('room-reset', ({ message }) => {
       if (message) {
         alert(message);
@@ -434,6 +788,9 @@ function App() {
       socket.off('ability-choice-required');
       socket.off('chat-history');
       socket.off('chat-message');
+      socket.off('bot-match-completed');
+      socket.off('bot-match-failed');
+      socket.off('disconnect', handleSocketDisconnect);
       socket.off('room-reset');
       socket.off('error');
     };
@@ -470,6 +827,10 @@ function App() {
     setShowDiscardModal(false);
     setAbilityChoice(null);
     setSelectedAbilityChoiceIds([]);
+    setShowBotModeSetup(false);
+    setBotModeRunning(false);
+    setBotModeResult(null);
+    setBotModeError('');
   };
 
   const handleCreateRoom = () => {
@@ -492,6 +853,40 @@ function App() {
 
   const handleRemoveBot = (botId) => {
     socket.emit('remove-bot', { roomId: currentRoom, botId });
+  };
+
+  const handleBotModeCountChange = (botCount) => {
+    setBotModePolicyVersions(currentPolicies => {
+      const nextPolicies = currentPolicies.slice(0, botCount);
+      while (nextPolicies.length < botCount) {
+        const availablePolicy = BOT_POLICY_OPTIONS.find(option => !nextPolicies.includes(option.value));
+        nextPolicies.push(availablePolicy.value);
+      }
+      return nextPolicies;
+    });
+  };
+
+  const handleBotModePolicyChange = (botIndex, policyVersion) => {
+    setBotModePolicyVersions(currentPolicies => currentPolicies.map((currentPolicy, index) => (
+      index === botIndex ? policyVersion : currentPolicy
+    )));
+  };
+
+  const handleRunBotModeMatch = () => {
+    if (!socket.connected) {
+      setBotModeError('The server is not connected. Please try again when the connection returns.');
+      return;
+    }
+    setBotModeRunning(true);
+    setBotModeResult(null);
+    setBotModeError('');
+    socket.emit('run-bot-match', { policyVersions: botModePolicyVersions });
+  };
+
+  const handleCloseBotMode = () => {
+    setShowBotModeSetup(false);
+    setBotModeResult(null);
+    setBotModeError('');
   };
 
   const handleDraftFaction = (factionName) => {
@@ -547,6 +942,31 @@ function App() {
     }
     resetAppToLobby();
   };
+
+  if (!currentRoom && showBotModeSetup) {
+    if (botModeResult) {
+      return (
+        <BotModeResult
+          result={botModeResult}
+          onBackToLobby={handleCloseBotMode}
+          onChangeLineup={() => setBotModeResult(null)}
+          onRunAgain={handleRunBotModeMatch}
+        />
+      );
+    }
+    return (
+      <BotModeSetup
+        botCount={botModePolicyVersions.length}
+        error={botModeError}
+        isRunning={botModeRunning}
+        policyVersions={botModePolicyVersions}
+        onBack={handleCloseBotMode}
+        onBotCountChange={handleBotModeCountChange}
+        onPolicyChange={handleBotModePolicyChange}
+        onRun={handleRunBotModeMatch}
+      />
+    );
+  }
 
   if (gamePhase === 'finished') {
     const standings = gameResult?.standings || [...players]
@@ -1838,6 +2258,28 @@ function App() {
 
           <div style={{ marginBottom: '15px' }}>
             <button onClick={handleCreateRoom}>Create Room</button>
+          </div>
+
+          <div style={{ marginBottom: '18px' }}>
+            <button
+              type="button"
+              onClick={() => {
+                setBotModeResult(null);
+                setBotModeError('');
+                setShowBotModeSetup(true);
+              }}
+              style={{
+                background: '#243b53',
+                border: 'none',
+                borderRadius: '5px',
+                color: 'white',
+                cursor: 'pointer',
+                fontWeight: 'bold',
+                padding: '10px 18px'
+              }}
+            >
+              Open Bot Mode
+            </button>
           </div>
 
           <hr />

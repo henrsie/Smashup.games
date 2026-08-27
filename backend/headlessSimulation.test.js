@@ -6,6 +6,7 @@ const {
     createHeadlessRoom,
     runHeadlessSimulation
 } = require('./headlessSimulation.js');
+const { BOT_POLICY_VERSIONS } = require('./botPolicies.js');
 const { normalizeRandomSeed } = require('./random.js');
 
 test('headless rooms contain only seeded bot players', () => {
@@ -21,6 +22,52 @@ test('headless rooms contain only seeded bot players', () => {
     assert.throws(
         () => createHeadlessRoom({ playerCount: MAX_HEADLESS_PLAYER_COUNT + 1 }),
         /factions are available/
+    );
+});
+
+test('headless rooms assign a different policy version to each player', () => {
+    const policyVersions = [
+        BOT_POLICY_VERSIONS.RANDOM,
+        BOT_POLICY_VERSIONS.GREEDY_HEURISTIC_1,
+        BOT_POLICY_VERSIONS.GREEDY_HEURISTIC_2
+    ];
+    const room = createHeadlessRoom({ policyVersions, randomSeed: 17 });
+
+    assert.equal(room.players.length, policyVersions.length);
+    assert.deepEqual(
+        room.players.map(player => player.policyVersion),
+        policyVersions
+    );
+    assert.throws(
+        () => createHeadlessRoom({ playerCount: 2, policyVersions }),
+        /exactly one entry per headless player/
+    );
+    assert.throws(
+        () => createHeadlessRoom({ policyVersions: [BOT_POLICY_VERSIONS.RANDOM, ''] }),
+        /non-empty string/
+    );
+});
+
+test('headless simulation dispatches each player through their configured policy', async () => {
+    const policyVersions = [
+        BOT_POLICY_VERSIONS.RANDOM,
+        BOT_POLICY_VERSIONS.GREEDY_HEURISTIC_1,
+        BOT_POLICY_VERSIONS.GREEDY_HEURISTIC_2
+    ];
+    const result = await runHeadlessSimulation({
+        policyVersions,
+        randomSeed: 23,
+        maxDecisions: 3
+    });
+
+    assert.equal(result.truncated, true);
+    assert.deepEqual(
+        result.room.players.map(player => player.policyVersion),
+        policyVersions
+    );
+    assert.deepEqual(
+        result.trajectory.metadata.players.map(player => player.policyVersion),
+        policyVersions
     );
 });
 

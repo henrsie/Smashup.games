@@ -17,7 +17,8 @@ function createHeadlessEnvironmentManager({ idFactory = randomUUID } = {}) {
         create(options = {}) {
             const environmentId = idFactory();
             const environment = new HeadlessSimulationEnvironment({
-                playerCount: options.playerCount ?? DEFAULT_HEADLESS_PLAYER_COUNT,
+                playerCount: options.playerCount ?? options.policyVersions?.length ?? DEFAULT_HEADLESS_PLAYER_COUNT,
+                policyVersions: options.policyVersions,
                 randomSeed: options.randomSeed,
                 policyVersion: options.policyVersion || EXTERNAL_PYTHON_POLICY_VERSION,
                 maxDecisions: options.maxDecisions ?? DEFAULT_MAX_DECISIONS,
@@ -41,6 +42,7 @@ function createHeadlessEnvironmentManager({ idFactory = randomUUID } = {}) {
             if (!environment) return null;
             return environment.reset({
                 playerCount: options.playerCount,
+                policyVersions: options.policyVersions,
                 randomSeed: options.randomSeed ?? options.seed,
                 policyVersion: options.policyVersion,
                 maxDecisions: options.maxDecisions,
