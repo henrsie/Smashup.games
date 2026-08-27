@@ -5,6 +5,19 @@ const { Server } = require('socket.io');
 const { buildBaseDeck } = require('./bases.js');
 const { factionsData, buildFactionDeck } = require('./factions.js');
 const { getTriggeredEffects } = require('./abilityQueue.js');
+const {
+    BOT_POLICY_VERSIONS,
+    chooseGreedyHeuristic1ActionIndex,
+    chooseGreedyHeuristic2ActionIndex,
+    getBotPolicy
+} = require('./botPolicies.js');
+const {
+    RANDOM_ALGORITHM,
+    generateRandomSeed,
+    initializeSeededRandom,
+    nextSeededRandom,
+    systemRandom
+} = require('./random.js');
 
 const PORT = Number.parseInt(process.env.PORT || '3000', 10);
 const allowedOrigins = (
@@ -17,11 +30,18 @@ const SOCKET_CORS_OPTIONS = {
     origin: allowedOrigins
 };
 const MAX_PLAYERS = 4;
+const MAX_HAND_SIZE = 10;
 const MAX_CHAT_HISTORY = 100;
 const MAX_CHAT_MESSAGE_LENGTH = 500;
 const BOT_ACTION_DELAY_MS = 600;
 const MAX_CONSECUTIVE_BOT_ACTIONS = 100;
 const DISCONNECT_GRACE_PERIOD_MS = 10_000;
+const TRAJECTORY_SCHEMA_VERSION = 3;
+const OBSERVATION_SCHEMA_VERSION = 3;
+const DEFAULT_BOT_POLICY_VERSION = BOT_POLICY_VERSIONS.RANDOM;
+const WINNING_VICTORY_POINTS = 15;
+const WIN_REWARD = 1;
+const LOSS_REWARD = -1;
 const createInitialTurnState = () => ({
     actionPlayed: false,
     minionPlayed: false,
@@ -98,7 +118,12 @@ function addLobbyParticipant(room, participant) {
     return { role: 'player', participant: player };
 }
 
-function addLobbyBot(room, requesterId, roomId = 'ROOM') {
+function addLobbyBot(
+    room,
+    requesterId,
+    roomId = 'ROOM',
+    policyVersion = DEFAULT_BOT_POLICY_VERSION
+) {
     if (!room) return failGameAction('room_not_found', 'Room not found.');
     if (room.gamePhase !== 'lobby') {
         return failGameAction('invalid_phase', 'Bots can only be added while the game is in the lobby.');
@@ -108,6 +133,9 @@ function addLobbyBot(room, requesterId, roomId = 'ROOM') {
     }
     if (room.players.length >= MAX_PLAYERS) {
         return failGameAction('lobby_full', `A game can have at most ${MAX_PLAYERS} players.`);
+    }
+    if (!getBotPolicy(policyVersion)) {
+        return failGameAction('invalid_bot_policy', 'That bot strategy is not supported.');
     }
 
     const botNumber = room.players.filter(player => player.isBot === true).length + 1;
@@ -127,7 +155,8 @@ function addLobbyBot(room, requesterId, roomId = 'ROOM') {
         deck: [],
         discardPile: [],
         online: true,
-        isBot: true
+        isBot: true,
+        policyVersion
     };
 
     room.nextBotIdNumber = botIdNumber + 1;
@@ -174,6 +203,11 @@ function destroyRoom(roomId) {
     const room = rooms[roomId];
     if (!room) return false;
 
+    finalizeRoomTrajectory(room, {
+        truncated: true,
+        terminationReason: 'room_closed',
+        cloneResult: false
+    });
     room.players.forEach(player => {
         if (!disconnectTimers[player.id]) return;
         clearTimeout(disconnectTimers[player.id]);
@@ -184,21 +218,59 @@ function destroyRoom(roomId) {
     return true;
 }
 
+function removeFinishedGamePlayer(roomId, playerId) {
+    const room = rooms[roomId];
+    if (!room) return false;
+    room.players = room.players.filter(player => player.id !== playerId);
+    if (disconnectTimers[playerId]) {
+        clearTimeout(disconnectTimers[playerId]);
+        delete disconnectTimers[playerId];
+    }
+
+    if (!roomHasHumanPlayers(room)) {
+        destroyRoom(roomId);
+        return true;
+    }
+    if (room.host === playerId) room.host = getNextHumanHostId(room);
+    io.to(roomId).emit('update-players', {
+        players: room.players,
+        spectators: room.spectators || [],
+        host: room.host
+    });
+    return true;
+}
+
+function generateRoomId() {
+    let roomId;
+    do {
+        roomId = Math.floor(systemRandom() * (36 ** 5))
+            .toString(36)
+            .padStart(5, '0')
+            .toUpperCase();
+    } while (rooms[roomId]);
+    return roomId;
+}
+
 io.on('connection', (socket) => {
     console.log(`User connected: ${socket.id}`);
 
-    socket.on('create-room', ({ playerName }) => {
-        const roomId = Math.random().toString(36).substring(2, 7).toUpperCase();
-        rooms[roomId] = {
+    socket.on('create-room', ({ playerName, randomSeed } = {}) => {
+        const roomId = generateRoomId();
+        const room = {
             host: socket.id,
+            createdAt: new Date().toISOString(),
+            botPolicyVersion: DEFAULT_BOT_POLICY_VERSION,
             players: [{ id: socket.id, name: playerName, hand: [], deck: [], discardPile: [], online: true }],
             spectators: [],
             nextBotIdNumber: 1,
             gamePhase: 'lobby',
+            baseDiscardPile: [],
             pendingAbility: null,
             temporaryEffects: [],
             chatMessages: []
         };
+        initializeSeededRandom(room, randomSeed ?? generateRandomSeed());
+        rooms[roomId] = room;
 
         socket.join(roomId);
         socket.emit('room-created', {
@@ -248,7 +320,8 @@ io.on('connection', (socket) => {
                         currentTurnPlayerId: room.currentTurnPlayerId,
                         turnState: room.turnState,
                         gamePhase: room.gamePhase,
-                        battleLog: room.battleLog
+                        battleLog: room.battleLog,
+                        gameResult: room.gameResult || null
                     });
                 }
 
@@ -273,7 +346,8 @@ io.on('connection', (socket) => {
                     draftState: room.gamePhase === 'drafting' ? sanitizeDraftState(room.draftState) : null,
                     currentTurnPlayerId: room.currentTurnPlayerId,
                     turnState: room.turnState,
-                    battleLog: room.battleLog
+                    battleLog: room.battleLog,
+                    gameResult: room.gameResult || null
                 });
 
                 io.to(formattedRoomId).emit('update-players', { players: room.players, spectators: room.spectators, host: room.host });
@@ -299,9 +373,9 @@ io.on('connection', (socket) => {
         }
     });
 
-    socket.on('add-bot', ({ roomId } = {}) => {
+    socket.on('add-bot', ({ roomId, policyVersion } = {}) => {
         const room = rooms[roomId];
-        const result = addLobbyBot(room, socket.id, roomId);
+        const result = addLobbyBot(room, socket.id, roomId, policyVersion);
         if (!result.ok) return socket.emit('error', result.error);
 
         io.to(roomId).emit('update-players', {
@@ -427,6 +501,9 @@ io.on('connection', (socket) => {
 
                 socket.leave(roomId);
                 io.to(roomId).emit('update-players', { players: room.players, spectators: room.spectators || [] });
+            } else if (room.gamePhase === 'finished') {
+                socket.leave(roomId);
+                removeFinishedGamePlayer(roomId, socket.id);
             }
         }
     });
@@ -464,6 +541,8 @@ io.on('connection', (socket) => {
                     disconnectTimers[player.id] = setTimeout(() => {
                         handlePlayerKick(roomId, player.id);
                     }, DISCONNECT_GRACE_PERIOD_MS);
+                } else if (room.gamePhase === 'finished') {
+                    removeFinishedGamePlayer(roomId, socket.id);
                 }
                 break;
             }
@@ -489,6 +568,7 @@ io.on('connection', (socket) => {
                 player.vp = 0;
             });
 
+            room.gameStartedAt = new Date().toISOString();
             room.gamePhase = 'drafting';
 
             io.to(roomId).emit('draft-started', {
@@ -553,6 +633,11 @@ function createActionActor(actorId, actorTransport) {
 function emitActorEvent(actor, event, payload) {
     if (typeof actor?.emit === 'function') actor.emit(event, payload);
     else if (actor?.id) io.to(actor.id).emit(event, payload);
+}
+
+function emitTriggeredChoice(room, playerId, payload) {
+    if (room?.headless === true) return;
+    io.to(playerId).emit('ability-choice-required', payload);
 }
 
 function validatePlayCardAction(room, actorId, action) {
@@ -880,6 +965,12 @@ function executeResolveAbilityChoiceAction({ room, roomId, actorId, action, acto
             code: 'invalid_hand_card',
             error: 'That hand card is no longer a valid target.'
         },
+        handLimitDiscard: {
+            resolve: () => resolveBotHandLimitDiscard(room, actor, choice),
+            code: 'invalid_hand_limit_discard',
+            error: 'That card is no longer a valid hand-limit discard.',
+            resume: false
+        },
         baseDeckSwap: {
             resolve: () => resolveBaseDeckSwap(room, choice, continuation),
             code: 'invalid_base_replacement',
@@ -1009,21 +1100,23 @@ function validateDraftFactionAction(room, actorId, action) {
 
 function finishFactionDraft(room, draft) {
     room.gamePhase = 'playing';
+    const random = () => nextSeededRandom(room);
 
-    const baseDeck = buildBaseDeck();
+    const baseDeck = buildBaseDeck(random);
     room.activeBases = baseDeck.splice(0, 3).map(base => ({
         ...base,
         playedCards: []
     }));
     room.baseDeck = baseDeck;
+    room.baseDiscardPile = [];
 
     room.players.forEach(player => {
         const playerFactions = draft.picks[player.id] || ['Aliens', 'Dinosaurs'];
         const combinedDeck = [
-            ...buildFactionDeck(playerFactions[0]),
-            ...buildFactionDeck(playerFactions[1])
+            ...buildFactionDeck(playerFactions[0], random),
+            ...buildFactionDeck(playerFactions[1], random)
         ];
-        shuffleDeck(combinedDeck);
+        shuffleDeck(combinedDeck, random);
 
         player.factions = playerFactions;
         player.hand = combinedDeck.splice(0, 5);
@@ -1132,10 +1225,76 @@ function cleanupDelayedDiscardCards(room) {
     });
 }
 
-function drawEndTurnCards(player) {
+function getCurrentSourceCardInstanceId(room) {
+    return room.currentResolutionContext?.sourceCardInstanceId
+        || room.pendingAbility?.continuation?.context?.sourceCardInstanceId
+        || null;
+}
+
+function ensurePlayerDeckCards(room, player, requiredCount = 1) {
+    if (!player || player.deck.length >= requiredCount || player.discardPile.length === 0) return false;
+
+    const excludedInstanceId = getCurrentSourceCardInstanceId(room);
+    const recyclableCards = player.discardPile.filter(card => card.instanceId !== excludedInstanceId);
+    if (recyclableCards.length === 0) return false;
+
+    const recyclableIds = new Set(recyclableCards.map(card => card.instanceId));
+    player.discardPile = player.discardPile.filter(card => !recyclableIds.has(card.instanceId));
+    shuffleDeck(recyclableCards, () => nextSeededRandom(room));
+    player.deck.push(...recyclableCards);
+    addBattleLog(room, `**${player.name}** shuffles their discard pile to form a new deck.`);
+    return true;
+}
+
+function drawPlayerCard(room, player) {
+    ensurePlayerDeckCards(room, player, 1);
+    return player?.deck.shift() || null;
+}
+
+function drawEndTurnCards(room, player) {
     for (let index = 0; index < 2; index += 1) {
-        if (player.deck.length > 0) player.hand.push(player.deck.shift());
+        const card = drawPlayerCard(room, player);
+        if (card) player.hand.push(card);
     }
+}
+
+function queueBotHandLimitDiscard(room, player) {
+    if (player?.isBot !== true || player.hand.length <= MAX_HAND_SIZE) return false;
+
+    room.pendingAbility = {
+        type: 'handLimitDiscard',
+        playerId: player.id,
+        endingPlayerId: player.id,
+        candidateIds: player.hand.map(card => card.instanceId),
+        cardsRemaining: player.hand.length - MAX_HAND_SIZE
+    };
+    return true;
+}
+
+function resolveBotHandLimitDiscard(room, actor, choice) {
+    const pendingAbility = room.pendingAbility;
+    const player = room.players.find(candidate => candidate.id === actor.id);
+    if (pendingAbility?.type !== 'handLimitDiscard'
+        || player?.isBot !== true
+        || player.hand.length <= MAX_HAND_SIZE
+        || !pendingAbility.candidateIds.includes(choice?.cardInstanceId)) return false;
+
+    const cardIndex = player.hand.findIndex(card => card.instanceId === choice.cardInstanceId);
+    if (cardIndex < 0) return false;
+
+    const [discardedCard] = player.hand.splice(cardIndex, 1);
+    player.discardPile.push(discardedCard);
+    addBattleLog(room, `**${player.name}** discards **${discardedCard.name}** to meet the hand limit.`);
+
+    if (player.hand.length > MAX_HAND_SIZE) {
+        pendingAbility.candidateIds = player.hand.map(card => card.instanceId);
+        pendingAbility.cardsRemaining = player.hand.length - MAX_HAND_SIZE;
+    } else {
+        const endingPlayerId = pendingAbility.endingPlayerId;
+        room.pendingAbility = null;
+        advanceToNextTurn(room, endingPlayerId);
+    }
+    return true;
 }
 
 function advanceToNextTurn(room, actorId) {
@@ -1174,6 +1333,9 @@ function executeEndTurnAction({
 
     const scoringBases = getScoringBases(room);
     if (scoringBases.length > 0) {
+        const scoringBaseIds = scoringBases
+            .map(baseIndex => room.activeBases[baseIndex]?.id)
+            .filter(Boolean);
         scoringBases.forEach(baseIndex => {
             addBattleLog(room, `**${room.activeBases[baseIndex].name}** is scoring!`);
         });
@@ -1197,13 +1359,18 @@ function executeEndTurnAction({
             if (!roomStillExists()) return;
 
             const finishScoringTurn = () => {
-                drawEndTurnCards(player);
+                drawEndTurnCards(room, player);
                 cleanupDelayedDiscardCards(room);
                 clearTemporaryEffects(room);
+                if (finishGameIfNeeded(room, roomId)) return;
+                if (queueBotHandLimitDiscard(room, player)) return;
                 advanceToNextTurn(room, actorId);
             };
             const scoreEligibleBases = () => {
-                scoringBases.forEach(baseIndex => scoreBase(room, baseIndex));
+                scoringBaseIds.forEach(baseId => {
+                    const currentBaseIndex = room.activeBases.findIndex(base => base.id === baseId);
+                    if (currentBaseIndex >= 0) scoreBase(room, currentBaseIndex);
+                });
                 room.afterTriggeredAbilitiesResolved = finishScoringTurn;
                 if (!processNextTriggeredAbility(room, roomId)) finishAfterTriggeredAbilities(room);
             };
@@ -1223,10 +1390,26 @@ function executeEndTurnAction({
         };
     }
 
-    drawEndTurnCards(player);
+    drawEndTurnCards(room, player);
     addBattleLog(room, `**${player.name}** has ended their turn`);
     cleanupDelayedDiscardCards(room);
     clearTemporaryEffects(room);
+    const gameResult = finishGameIfNeeded(room, roomId);
+    if (gameResult) {
+        return {
+            ok: true,
+            gameFinished: true,
+            gameResult,
+            turnCompleted: true
+        };
+    }
+    if (queueBotHandLimitDiscard(room, player)) {
+        return {
+            ok: true,
+            pendingAbility: room.pendingAbility,
+            turnCompleted: false
+        };
+    }
     const nextPlayer = advanceToNextTurn(room, actorId);
 
     return {
@@ -1250,6 +1433,7 @@ function executeGameAction({
     if (!action || typeof action.type !== 'string') {
         return failGameAction('invalid_action', 'A game action type is required.');
     }
+    const decisionMetadata = getOrCreateDecisionMetadata(room, actorId);
 
     let result;
     if (action.type === 'play-card') {
@@ -1274,12 +1458,403 @@ function executeGameAction({
     }
 
     if (result.ok) {
+        completeDecisionStep(room, actorId, decisionMetadata);
         (result.roomEvents || []).forEach(({ event, payload }) => {
             if (emitRoomEvent) emitRoomEvent(roomId, event, payload);
         });
         if (!result.suppressDefaultStateEmission && emitState) emitState(roomId, room);
     }
     return result;
+}
+
+function cloneObservationValue(value) {
+    if (value === undefined) return undefined;
+    return JSON.parse(JSON.stringify(value));
+}
+
+function getDecisionActorId(room) {
+    if (!room) return null;
+    if (room.pendingAbility?.playerId) return room.pendingAbility.playerId;
+    if (room.gamePhase === 'drafting') {
+        return room.draftState?.draftOrder?.[room.draftState.currentTurnIndex] || null;
+    }
+    if (room.gamePhase === 'playing') return room.currentTurnPlayerId || null;
+    return null;
+}
+
+function getDecisionType(room) {
+    if (room.pendingAbility?.type) return room.pendingAbility.type;
+    if (room.gamePhase === 'drafting') return 'draftFaction';
+    if (room.gamePhase === 'playing') return 'turnAction';
+    return null;
+}
+
+function getDecisionTracker(room) {
+    if (!room.decisionTracker) {
+        room.decisionTracker = {
+            nextResolutionNumber: 1,
+            current: null
+        };
+    }
+    return room.decisionTracker;
+}
+
+function getOrCreateDecisionMetadata(room, playerId) {
+    if (!room || getDecisionActorId(room) !== playerId) return null;
+    const tracker = getDecisionTracker(room);
+    if (tracker.current?.playerId === playerId) return tracker.current;
+
+    tracker.current = {
+        resolutionId: `resolution-${tracker.nextResolutionNumber}`,
+        decisionType: getDecisionType(room),
+        stepIndex: 0,
+        playerId
+    };
+    tracker.nextResolutionNumber += 1;
+    return tracker.current;
+}
+
+function completeDecisionStep(room, actorId, decisionMetadata) {
+    if (!room?.decisionTracker || !decisionMetadata) return;
+    const nextActorId = getDecisionActorId(room);
+    if (room.pendingAbility && nextActorId === actorId) {
+        room.decisionTracker.current = {
+            resolutionId: decisionMetadata.resolutionId,
+            decisionType: getDecisionType(room),
+            stepIndex: decisionMetadata.stepIndex + 1,
+            playerId: actorId
+        };
+        return;
+    }
+    room.decisionTracker.current = null;
+}
+
+function getPlayerObservation(room, playerId) {
+    const observer = room?.players?.find(player => player.id === playerId);
+    if (!room || !observer) return null;
+
+    const pendingAbility = room.pendingAbility;
+    let pendingDecision = null;
+    if (pendingAbility) {
+        const publicDecision = {
+            type: pendingAbility.type,
+            playerId: pendingAbility.playerId,
+            sourceCardName: pendingAbility.sourceCardName || null,
+            sourceBaseName: pendingAbility.sourceBaseName || null,
+            controlledByObserver: pendingAbility.playerId === playerId
+        };
+
+        if (pendingAbility.playerId === playerId) {
+            const { continuation, ...visibleDecision } = pendingAbility;
+            pendingDecision = {
+                ...cloneObservationValue(visibleDecision),
+                controlledByObserver: true
+            };
+        } else {
+            pendingDecision = publicDecision;
+        }
+    }
+
+    const decisionMetadata = getOrCreateDecisionMetadata(room, playerId);
+    return {
+        schemaVersion: OBSERVATION_SCHEMA_VERSION,
+        observerPlayerId: playerId,
+        resolutionId: decisionMetadata?.resolutionId || null,
+        decisionType: decisionMetadata?.decisionType || null,
+        stepIndex: decisionMetadata?.stepIndex ?? null,
+        gamePhase: room.gamePhase || 'lobby',
+        hostId: room.host || null,
+        currentTurnPlayerId: room.currentTurnPlayerId || null,
+        isObserverTurn: room.currentTurnPlayerId === playerId,
+        players: room.players.map(player => ({
+            id: player.id,
+            name: player.name,
+            isBot: player.isBot === true,
+            online: player.online !== false,
+            vp: Number.isFinite(player.vp) ? player.vp : 0,
+            factions: cloneObservationValue(player.factions || []),
+            hand: player.id === playerId ? cloneObservationValue(player.hand || []) : null,
+            handCount: player.hand?.length || 0,
+            deckCount: player.deck?.length || 0,
+            discardPile: cloneObservationValue(player.discardPile || [])
+        })),
+        activeBases: cloneObservationValue(room.activeBases || []),
+        baseDeckCount: room.baseDeck?.length || 0,
+        baseDiscardPile: cloneObservationValue(room.baseDiscardPile || []),
+        turnState: cloneObservationValue(room.turnState || null),
+        temporaryEffects: cloneObservationValue(room.temporaryEffects || []),
+        pendingDecision,
+        gameResult: cloneObservationValue(room.gameResult || null),
+        draftState: room.draftState
+            ? cloneObservationValue(sanitizeDraftState(room.draftState))
+            : null,
+        recentBattleLog: cloneObservationValue((room.battleLog || []).slice(0, 10))
+    };
+}
+
+function ensureRoomTrajectory(room, roomId) {
+    if (!room.rlTrajectory) {
+        const startedAt = room.gameStartedAt || new Date().toISOString();
+        room.rlTrajectory = {
+            schemaVersion: TRAJECTORY_SCHEMA_VERSION,
+            gameId: roomId,
+            metadata: {
+                trajectorySchemaVersion: TRAJECTORY_SCHEMA_VERSION,
+                observationSchemaVersion: OBSERVATION_SCHEMA_VERSION,
+                gameId: roomId,
+                policyVersion: room.botPolicyVersion || DEFAULT_BOT_POLICY_VERSION,
+                randomSeed: room.randomSeed ?? null,
+                randomAlgorithm: room.randomAlgorithm || RANDOM_ALGORITHM,
+                startedAt,
+                completedAt: null,
+                terminationReason: null,
+                terminated: false,
+                truncated: false,
+                decisionCount: 0,
+                players: [],
+                gameResult: null
+            },
+            nextDecisionIndex: 0,
+            entries: [],
+            pendingEntryIndexByPlayer: {}
+        };
+    }
+    return room.rlTrajectory;
+}
+
+function syncTrajectoryMetadata(room, trajectory) {
+    trajectory.metadata.players = room.players.map((player, seatIndex) => ({
+        seatIndex,
+        playerId: player.id,
+        name: player.name,
+        isBot: player.isBot === true,
+        policyVersion: player.isBot === true
+            ? player.policyVersion || trajectory.metadata.policyVersion
+            : null,
+        factions: cloneObservationValue(
+            player.factions
+            || room.draftState?.picks?.[player.id]
+            || []
+        ),
+        finalVictoryPoints: Number.isFinite(player.vp) ? player.vp : 0
+    }));
+    trajectory.metadata.decisionCount = trajectory.entries.length;
+    trajectory.metadata.gameResult = cloneObservationValue(room.gameResult || null);
+}
+
+function getObservationVictoryPoints(observation, playerId) {
+    const player = observation?.players?.find(candidate => candidate.id === playerId);
+    return Number.isFinite(player?.vp) ? player.vp : 0;
+}
+
+function finalizePendingTrajectoryEntry(
+    trajectory,
+    playerId,
+    nextObservation,
+    { terminated = false, truncated = false, terminalRewards = {} } = {}
+) {
+    const entryIndex = trajectory.pendingEntryIndexByPlayer[playerId];
+    if (!Number.isInteger(entryIndex)) return false;
+
+    const entry = trajectory.entries[entryIndex];
+    entry.nextObservation = cloneObservationValue(nextObservation);
+    entry.vpReward = getObservationVictoryPoints(nextObservation, playerId)
+        - getObservationVictoryPoints(entry.observation, playerId);
+    entry.terminalReward = Number(terminalRewards[playerId]) || 0;
+    entry.reward = entry.vpReward + entry.terminalReward;
+    entry.terminated = terminated;
+    entry.truncated = truncated;
+    entry.done = terminated || truncated;
+    delete trajectory.pendingEntryIndexByPlayer[playerId];
+    return true;
+}
+
+function recordTrajectoryDecision({
+    room,
+    roomId,
+    playerId,
+    observation,
+    legalActions,
+    chosenAction,
+    chosenActionIndex
+}) {
+    if (!room || !observation) return null;
+    const trajectory = ensureRoomTrajectory(room, roomId);
+    const pendingEntryIndex = trajectory.pendingEntryIndexByPlayer[playerId];
+    if (room.gamePhase === 'finished' && !Number.isInteger(pendingEntryIndex)) {
+        const previousEntry = [...trajectory.entries]
+            .reverse()
+            .find(entry => entry.playerId === playerId && entry.terminated);
+        if (previousEntry) {
+            previousEntry.nextObservation = cloneObservationValue(observation);
+            previousEntry.vpReward = getObservationVictoryPoints(observation, playerId)
+                - getObservationVictoryPoints(previousEntry.observation, playerId);
+            previousEntry.terminalReward = 0;
+            previousEntry.reward = previousEntry.vpReward;
+            previousEntry.terminated = false;
+            previousEntry.truncated = false;
+            previousEntry.done = false;
+        }
+    }
+    finalizePendingTrajectoryEntry(trajectory, playerId, observation);
+
+    const resolvedActionIndex = Number.isInteger(chosenActionIndex)
+        && chosenActionIndex >= 0
+        && chosenActionIndex < legalActions.length
+        && JSON.stringify(legalActions[chosenActionIndex]) === JSON.stringify(chosenAction)
+        ? chosenActionIndex
+        : legalActions.findIndex(action => JSON.stringify(action) === JSON.stringify(chosenAction));
+    const entry = {
+        decisionIndex: trajectory.nextDecisionIndex,
+        playerId,
+        resolutionId: observation.resolutionId || null,
+        decisionType: observation.decisionType || null,
+        stepIndex: observation.stepIndex ?? null,
+        observation: cloneObservationValue(observation),
+        legalActions: cloneObservationValue(legalActions),
+        chosenActionIndex: resolvedActionIndex >= 0 ? resolvedActionIndex : null,
+        chosenAction: cloneObservationValue(chosenAction),
+        reward: null,
+        vpReward: null,
+        terminalReward: 0,
+        nextObservation: null,
+        terminated: false,
+        truncated: false,
+        done: false
+    };
+    trajectory.nextDecisionIndex += 1;
+    trajectory.entries.push(entry);
+    trajectory.pendingEntryIndexByPlayer[playerId] = trajectory.entries.length - 1;
+    if (room.gamePhase === 'finished') {
+        finalizePendingTrajectoryEntry(
+            trajectory,
+            playerId,
+            getPlayerObservation(room, playerId),
+            {
+                terminated: true,
+                terminalRewards: room.terminalRewards || {}
+            }
+        );
+    }
+    return cloneObservationValue(entry);
+}
+
+function finalizeRoomTrajectory(
+    room,
+    {
+        terminated = false,
+        truncated = false,
+        terminalRewards = {},
+        terminationReason = null,
+        cloneResult = true
+    } = {}
+) {
+    if (!room?.rlTrajectory) return null;
+    const trajectory = room.rlTrajectory;
+    Object.keys(trajectory.pendingEntryIndexByPlayer).forEach(playerId => {
+        finalizePendingTrajectoryEntry(
+            trajectory,
+            playerId,
+            getPlayerObservation(room, playerId),
+            { terminated, truncated, terminalRewards }
+        );
+    });
+    if ((terminated || truncated) && !trajectory.metadata.completedAt) {
+        trajectory.metadata.completedAt = new Date().toISOString();
+        trajectory.metadata.terminationReason = terminationReason
+            || (terminated ? 'terminated' : 'truncated');
+        trajectory.metadata.terminated = terminated;
+        trajectory.metadata.truncated = truncated;
+    }
+    syncTrajectoryMetadata(room, trajectory);
+    return getRoomTrajectory(room, { clone: cloneResult });
+}
+
+function getRoomTrajectory(room, { clone = true } = {}) {
+    if (!room?.rlTrajectory) return null;
+    syncTrajectoryMetadata(room, room.rlTrajectory);
+    const {
+        pendingEntryIndexByPlayer,
+        nextDecisionIndex,
+        ...trajectory
+    } = room.rlTrajectory;
+    return clone ? cloneObservationValue(trajectory) : trajectory;
+}
+
+function exportRoomTrajectoryJson(room, { pretty = false } = {}) {
+    const trajectory = getRoomTrajectory(room, { clone: false });
+    if (!trajectory) return null;
+    return JSON.stringify(trajectory, null, pretty ? 2 : undefined);
+}
+
+function buildFinalStandings(room) {
+    const seatOrder = new Map(room.players.map((player, index) => [player.id, index]));
+    const sortedPlayers = [...room.players].sort((left, right) => (
+        (right.vp || 0) - (left.vp || 0)
+        || seatOrder.get(left.id) - seatOrder.get(right.id)
+    ));
+    let previousVictoryPoints = null;
+    let previousRank = 0;
+
+    return sortedPlayers.map((player, index) => {
+        const victoryPoints = Number.isFinite(player.vp) ? player.vp : 0;
+        const rank = victoryPoints === previousVictoryPoints ? previousRank : index + 1;
+        previousVictoryPoints = victoryPoints;
+        previousRank = rank;
+        return {
+            rank,
+            playerId: player.id,
+            name: player.name,
+            vp: victoryPoints,
+            isBot: player.isBot === true,
+            factions: cloneObservationValue(player.factions || [])
+        };
+    });
+}
+
+function getCompletedGameResult(room) {
+    if (!room?.players?.length) return null;
+    const standings = buildFinalStandings(room);
+    const leadingVictoryPoints = standings[0]?.vp || 0;
+    const leaders = standings.filter(standing => standing.vp === leadingVictoryPoints);
+    if (leadingVictoryPoints < WINNING_VICTORY_POINTS || leaders.length !== 1) return null;
+
+    return {
+        winnerId: leaders[0].playerId,
+        winnerName: leaders[0].name,
+        winningVictoryPoints: leadingVictoryPoints,
+        standings
+    };
+}
+
+function finishGameIfNeeded(
+    room,
+    roomId,
+    { stopBotController = targetRoomId => botTurnController.stop(targetRoomId) } = {}
+) {
+    if (!room || room.gamePhase === 'finished') return room?.gameResult || null;
+    const gameResult = getCompletedGameResult(room);
+    if (!gameResult) return null;
+
+    room.gamePhase = 'finished';
+    room.currentTurnPlayerId = null;
+    room.gameResult = gameResult;
+    room.terminalRewards = Object.fromEntries(room.players.map(player => [
+        player.id,
+        player.id === gameResult.winnerId ? WIN_REWARD : LOSS_REWARD
+    ]));
+    addBattleLog(
+        room,
+        `**${gameResult.winnerName}** wins the game with **${gameResult.winningVictoryPoints} victory points**!`
+    );
+    finalizeRoomTrajectory(room, {
+        terminated: true,
+        terminalRewards: room.terminalRewards,
+        terminationReason: 'victory',
+        cloneResult: false
+    });
+    stopBotController(roomId);
+    return gameResult;
 }
 
 function getLegalActions(room, actorId) {
@@ -1358,25 +1933,6 @@ function createAbilityChoiceAction(choice) {
     return { type: 'resolve-ability-choice', choice };
 }
 
-function createPermutationActions(candidateIds) {
-    const uniqueIds = [...new Set(candidateIds || [])];
-    const permutations = [];
-    const visit = (remaining, ordered) => {
-        if (remaining.length === 0) {
-            permutations.push(createAbilityChoiceAction({ cardInstanceIds: ordered }));
-            return;
-        }
-        remaining.forEach((candidateId, index) => {
-            visit(
-                [...remaining.slice(0, index), ...remaining.slice(index + 1)],
-                [...ordered, candidateId]
-            );
-        });
-    };
-    visit(uniqueIds, []);
-    return permutations;
-}
-
 function getLegalAbilityChoiceActions(room, actorId) {
     const pending = room.pendingAbility;
     const player = room.players.find(candidate => candidate.id === actorId);
@@ -1407,6 +1963,10 @@ function getLegalAbilityChoiceActions(room, actorId) {
             return fromChoices(existingCardIds(selectedPlayer?.hand, pending.candidateIds)
                 .map(cardInstanceId => ({ cardInstanceId })));
         }
+        case 'handLimitDiscard':
+            if (player.isBot !== true || player.hand.length <= MAX_HAND_SIZE) return [];
+            return fromChoices(existingCardIds(player.hand, pending.candidateIds)
+                .map(cardInstanceId => ({ cardInstanceId })));
         case 'baseDeckSwap':
             return fromChoices((pending.candidateBaseIds || [])
                 .filter(baseId => room.baseDeck?.some(base => base.id === baseId))
@@ -1444,7 +2004,12 @@ function getLegalAbilityChoiceActions(room, actorId) {
         case 'deckReorder': {
             const cardIds = existingCardIds(player.deck, pending.cardIds);
             if (cardIds.length !== pending.cardIds.length) return [];
-            return createPermutationActions(cardIds);
+            const orderedIds = pending.orderedIds || [];
+            if (new Set(orderedIds).size !== orderedIds.length
+                || orderedIds.some(instanceId => !cardIds.includes(instanceId))) return [];
+            return fromChoices(cardIds
+                .filter(instanceId => !orderedIds.includes(instanceId))
+                .map(cardInstanceId => ({ cardInstanceId })));
         }
         case 'discardPlayCard':
         case 'discardPlayEach': {
@@ -1625,18 +2190,37 @@ function getBotDecisionActorId(room) {
     return null;
 }
 
-function chooseDefaultBotAction({ legalActions, room, random = Math.random }) {
-    if (room?.gamePhase === 'drafting') {
-        return legalActions[Math.floor(random() * legalActions.length)] || null;
-    }
-    return legalActions[0] || null;
+function chooseDefaultBotAction({ legalActions, random = systemRandom }) {
+    if (!legalActions.length) return null;
+    return legalActions[chooseDefaultBotActionIndex({ legalActions, random })];
+}
+
+function chooseDefaultBotActionIndex({ legalActions, random = systemRandom }) {
+    if (!legalActions.length) return null;
+    return Math.min(
+        Math.floor(random() * legalActions.length),
+        legalActions.length - 1
+    );
+}
+
+function chooseConfiguredBotActionIndex(context) {
+    const player = context.room?.players?.find(candidate => candidate.id === context.actorId);
+    const policyVersion = player?.policyVersion
+        || context.room?.botPolicyVersion
+        || DEFAULT_BOT_POLICY_VERSION;
+    const policy = getBotPolicy(policyVersion);
+    if (!policy) throw new Error(`Unsupported bot policy: ${policyVersion}`);
+    return policy(context);
 }
 
 function createBotTurnController({
     getRoom,
     getActions = getLegalActions,
+    getObservation = getPlayerObservation,
     executeAction,
-    chooseAction = chooseDefaultBotAction,
+    chooseAction = chooseConfiguredBotActionIndex,
+    recordDecision = recordTrajectoryDecision,
+    getRandom = nextSeededRandom,
     delayMs = BOT_ACTION_DELAY_MS,
     maxConsecutiveActions = MAX_CONSECUTIVE_BOT_ACTIONS,
     schedule = (callback, delay) => {
@@ -1719,17 +2303,35 @@ function createBotTurnController({
                 throw new Error('No legal actions are available for this bot decision.');
             }
 
-            const action = await chooseAction({ actorId, legalActions, room, roomId });
-            if (!action) throw new Error('The bot policy did not select an action.');
+            const observation = getObservation(room, actorId);
+            const actionIndex = await chooseAction({
+                actorId,
+                legalActions,
+                observation,
+                random: () => getRandom(room),
+                room,
+                roomId
+            });
+            if (!Number.isInteger(actionIndex)
+                || actionIndex < 0
+                || actionIndex >= legalActions.length) {
+                throw new Error('The bot policy did not select a valid legal-action index.');
+            }
+            const selectedAction = legalActions[actionIndex];
 
             const currentRoom = getRoom(roomId);
             const currentActorId = getBotDecisionActorId(currentRoom);
             const currentLegalActions = currentActorId === actorId
                 ? getActions(currentRoom, actorId)
                 : [];
-            if (!currentLegalActions.some(legalAction => actionsMatch(legalAction, action))) {
+            const currentActionIndex = currentLegalActions.findIndex(legalAction => (
+                actionsMatch(legalAction, selectedAction)
+            ));
+            if (currentActionIndex < 0) {
                 throw new Error('The bot policy selected an action that is no longer legal.');
             }
+            const action = currentLegalActions[currentActionIndex];
+            const currentObservation = getObservation(currentRoom, actorId);
 
             const result = await executeAction({
                 action,
@@ -1739,12 +2341,22 @@ function createBotTurnController({
             });
             if (!result?.ok) throw new Error(result?.error || 'The bot action was rejected.');
 
+            recordDecision({
+                chosenAction: action,
+                chosenActionIndex: currentActionIndex,
+                legalActions: currentLegalActions,
+                observation: currentObservation,
+                playerId: actorId,
+                room: currentRoom,
+                roomId
+            });
+
             if (state.lastActorId !== actorId) state.consecutiveActions = 0;
             state.lastActorId = actorId;
             state.consecutiveActions += 1;
             actionSucceeded = true;
-            onAction({ action, actorId, result, roomId });
-            return { ok: true, action, actorId, result };
+            onAction({ action, actionIndex: currentActionIndex, actorId, result, roomId });
+            return { ok: true, action, actionIndex: currentActionIndex, actorId, result };
         } catch (error) {
             reportError(roomId, actorId, error);
             return { ok: false, error, reason: 'action_failed' };
@@ -2107,7 +2719,9 @@ function resolveHandDiscard(room, socket, choice) {
 
 function queueBaseDeckSwap(room, roomId, socket, targetBase) {
     const targetBaseIndex = room.activeBases.indexOf(targetBase);
-    if (targetBaseIndex < 0 || room.baseDeck.length === 0) return false;
+    if (targetBaseIndex < 0) return false;
+    replenishBaseDeck(room);
+    if (room.baseDeck.length === 0) return false;
 
     room.pendingAbility = {
         type: 'baseDeckSwap',
@@ -2191,7 +2805,7 @@ function resolveAttachedActionSelection(room, roomId, socket, choice) {
 }
 
 function queueSeaDogsFaction(room, roomId, socket, base) {
-    if (isMovementPrevented(base, socket.id)) return false;
+    if (room.activeBases.length < 2 || isMovementPrevented(base, socket.id)) return false;
     const baseIndex = room.activeBases.indexOf(base);
     const factions = [...new Set(getBaseMinions(base)
         .filter(minion => minion.ownerId !== socket.id
@@ -2357,6 +2971,7 @@ function queueDiscardShuffle(room, roomId, socket, effect) {
 
 function queueRevealedDeckSelection(room, roomId, socket, effect) {
     const player = room.players.find(candidate => candidate.id === socket.id);
+    ensurePlayerDeckCards(room, player, effect.amount);
     const revealedCards = (player?.deck || []).slice(0, effect.amount);
     if (revealedCards.length === 0) return false;
     revealedCards.forEach(card => addBattleLog(room, { playerName: player.name, card, revealed: true }));
@@ -2499,7 +3114,7 @@ function executeMultiZoneSelection(room, roomId, socket, player, pendingAbility)
         const selected = player.discardPile.filter(card => pendingAbility.selectedIds.includes(card.instanceId));
         player.discardPile = player.discardPile.filter(card => !pendingAbility.selectedIds.includes(card.instanceId));
         player.deck.push(...selected);
-        shuffleDeck(player.deck);
+        shuffleDeck(player.deck, () => nextSeededRandom(room));
     }
 
     if (pendingAbility.action === 'moveRevealedCardsToHand') {
@@ -2525,14 +3140,14 @@ function executeMultiZoneSelection(room, roomId, socket, player, pendingAbility)
         const selectedId = pendingAbility.selectedIds[0];
         const cardIndex = player.deck.findIndex(card => card.instanceId === selectedId);
         if (cardIndex >= 0) player.hand.push(player.deck.splice(cardIndex, 1)[0]);
-        shuffleDeck(player.deck);
+        shuffleDeck(player.deck, () => nextSeededRandom(room));
     }
 
     if (pendingAbility.action === 'moveDeckCardsToDiscard') {
         const selected = player.deck.filter(card => pendingAbility.selectedIds.includes(card.instanceId));
         player.deck = player.deck.filter(card => !pendingAbility.selectedIds.includes(card.instanceId));
         player.discardPile.push(...selected);
-        shuffleDeck(player.deck);
+        shuffleDeck(player.deck, () => nextSeededRandom(room));
     }
 
     room.pendingAbility = null;
@@ -2549,7 +3164,8 @@ function queueDeckReorder(room, roomId, socket, cards, message) {
     room.pendingAbility = {
         type: 'deckReorder',
         playerId: socket.id,
-        cardIds: orderedCards.map(card => card.instanceId)
+        cardIds: orderedCards.map(card => card.instanceId),
+        orderedIds: []
     };
     emitCardChoices(socket, roomId, message, orderedCards, false, {
         selectionMode: 'ordered',
@@ -2561,12 +3177,22 @@ function queueDeckReorder(room, roomId, socket, cards, message) {
 
 function resolveDeckReorder(room, socket, choice) {
     const pendingAbility = room.pendingAbility;
-    const orderedIds = choice?.cardInstanceIds;
-    if (!Array.isArray(orderedIds)
-        || orderedIds.length !== pendingAbility.cardIds.length
-        || new Set(orderedIds).size !== orderedIds.length
-        || orderedIds.some(instanceId => !pendingAbility.cardIds.includes(instanceId))) {
-        return false;
+    let orderedIds;
+    if (Array.isArray(choice?.cardInstanceIds)) {
+        orderedIds = choice.cardInstanceIds;
+        if (orderedIds.length !== pendingAbility.cardIds.length
+            || new Set(orderedIds).size !== orderedIds.length
+            || orderedIds.some(instanceId => !pendingAbility.cardIds.includes(instanceId))) {
+            return false;
+        }
+    } else {
+        const cardInstanceId = choice?.cardInstanceId;
+        const stagedOrder = pendingAbility.orderedIds ||= [];
+        if (!pendingAbility.cardIds.includes(cardInstanceId)
+            || stagedOrder.includes(cardInstanceId)) return false;
+        stagedOrder.push(cardInstanceId);
+        if (stagedOrder.length < pendingAbility.cardIds.length) return true;
+        orderedIds = stagedOrder;
     }
 
     const player = room.players.find(candidate => candidate.id === socket.id);
@@ -2586,7 +3212,7 @@ function shuffleHandIntoDeck(room, playerId) {
     if (!player) return;
     player.deck.push(...player.hand);
     player.hand = [];
-    shuffleDeck(player.deck);
+    shuffleDeck(player.deck, () => nextSeededRandom(room));
 }
 
 function queueDiscardPlay(room, roomId, socket, effect, optional) {
@@ -2723,6 +3349,7 @@ function playMinionFromDiscard(room, player, card, baseIndex) {
 
 function queueTopDeckReveal(room, roomId, socket, effect, optional) {
     const player = room.players.find(candidate => candidate.id === socket.id);
+    ensurePlayerDeckCards(room, player, 1);
     const card = player?.deck?.[0];
     if (!card) return false;
 
@@ -2791,6 +3418,9 @@ function resolveTopDeckReveal(room, socket, choice) {
 }
 
 function queueMassEnchantment(room, roomId, socket) {
+    room.players
+        .filter(player => player.id !== socket.id)
+        .forEach(player => ensurePlayerDeckCards(room, player, 1));
     const revealed = room.players
         .filter(player => player.id !== socket.id && player.deck.length > 0)
         .map(player => ({ player, card: player.deck[0] }));
@@ -3016,6 +3646,7 @@ function resolveMoveDestination(room, socket, choice) {
 }
 
 function queueMoveTargetBatch(room, roomId, socket, effect) {
+    if (room.activeBases.length < 2) return false;
     const candidates = getEligibleMinions(room, socket.id, effect.target)
         .filter(minion => !isMovementPrevented(getBaseForMinion(room, minion.instanceId), socket.id));
     if (candidates.length === 0) return false;
@@ -3102,6 +3733,10 @@ function queueBatchMoveDestination(room, socket, minionInstanceId, remainingIds,
     const destinations = room.activeBases
         .map((base, index) => ({ base, index }))
         .filter(({ base }) => base !== sourceBase);
+    if (destinations.length === 0) {
+        room.pendingAbility = null;
+        return true;
+    }
     room.pendingAbility = {
         type: 'moveDestination',
         playerId: socket.id,
@@ -3127,6 +3762,7 @@ function getMoveLimit(effect) {
 }
 
 function queueMoveTarget(room, roomId, socket, effect, movedMinionIds, remainingMoves) {
+    if (room.activeBases.length < 2) return false;
     const candidates = getEligibleMinions(room, socket.id, effect.target)
         .filter(minion => !movedMinionIds.includes(minion.instanceId)
             && !isMovementPrevented(getBaseForMinion(room, minion.instanceId), socket.id));
@@ -3272,8 +3908,10 @@ function drawCards(room, playerId, amount) {
     const player = room.players.find(candidate => candidate.id === playerId);
     if (!player || amount <= 0) return;
 
-    for (let index = 0; index < amount && player.deck.length > 0; index += 1) {
-        player.hand.push(player.deck.shift());
+    for (let index = 0; index < amount; index += 1) {
+        const card = drawPlayerCard(room, player);
+        if (!card) break;
+        player.hand.push(card);
     }
 }
 
@@ -4063,7 +4701,7 @@ function appendChatMessage(room, sender, rawMessage) {
     }
 
     const message = {
-        id: `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
+        id: `${Date.now()}-${systemRandom().toString(36).slice(2, 10)}`,
         senderId: sender.id,
         senderName: sender.name,
         text,
@@ -4246,7 +4884,7 @@ function processNextTriggeredAbility(room, roomId) {
             scoringBaseName: trigger.scoringBaseName,
             useKey
         };
-        io.to(trigger.playerId).emit('ability-choice-required', {
+        emitTriggeredChoice(room, trigger.playerId, {
             roomId,
             message: `Play ${shinobi.name} on ${trigger.scoringBaseName} before it scores?`,
             choices: [
@@ -4272,7 +4910,7 @@ function processNextTriggeredAbility(room, roomId) {
             scoringBaseId: trigger.scoringBaseId,
             scoringBaseName: trigger.scoringBaseName
         };
-        io.to(trigger.playerId).emit('ability-choice-required', {
+        emitTriggeredChoice(room, trigger.playerId, {
             roomId,
             message: `Play ${action.name} before ${trigger.scoringBaseName} scores?`,
             choices: [
@@ -4298,7 +4936,7 @@ function processNextTriggeredAbility(room, roomId) {
             scoringBaseId: trigger.scoringBaseId,
             scoringBaseName: trigger.scoringBaseName
         };
-        io.to(trigger.playerId).emit('ability-choice-required', {
+        emitTriggeredChoice(room, trigger.playerId, {
             roomId,
             message: `Play ${action.name} before ${trigger.scoringBaseName} scores?`,
             choices: [
@@ -4325,7 +4963,7 @@ function processNextTriggeredAbility(room, roomId) {
             scoringBaseId: trigger.scoringBaseId,
             scoringBaseName: trigger.scoringBaseName
         };
-        io.to(trigger.playerId).emit('ability-choice-required', {
+        emitTriggeredChoice(room, trigger.playerId, {
             roomId,
             message: `Move ${minion.name} to ${trigger.scoringBaseName} before it scores?`,
             choices: [
@@ -4372,7 +5010,7 @@ function processNextTriggeredAbility(room, roomId) {
             amount: trigger.amount,
             sourceBaseName: trigger.sourceBaseName
         };
-        io.to(trigger.playerId).emit('ability-choice-required', {
+        emitTriggeredChoice(room, trigger.playerId, {
             roomId,
             message: `${trigger.sourceBaseName}: play an extra minion of power ${trigger.maxPower} or less here?`,
             choices: [
@@ -4392,7 +5030,7 @@ function processNextTriggeredAbility(room, roomId) {
             minionInstanceId: trigger.minionInstanceId,
             sourceBaseName: trigger.sourceBaseName
         };
-        io.to(trigger.playerId).emit('ability-choice-required', {
+        emitTriggeredChoice(room, trigger.playerId, {
             roomId,
             message: `Return ${minion.name} to your hand after ${trigger.sourceBaseName} scores?`,
             choices: [
@@ -4419,7 +5057,7 @@ function processNextTriggeredAbility(room, roomId) {
             destinationBaseIds: trigger.destinationBaseIds,
             sourceBaseName: trigger.sourceBaseName
         };
-        io.to(trigger.playerId).emit('ability-choice-required', {
+        emitTriggeredChoice(room, trigger.playerId, {
             roomId,
             message: `Move ${minion.name} to another base after ${trigger.sourceBaseName} scores?`,
             choices: [
@@ -4449,7 +5087,7 @@ function processNextTriggeredAbility(room, roomId) {
             destinationBaseIds: trigger.destinationBaseIds,
             sourceBaseName: trigger.sourceBaseName
         };
-        io.to(trigger.playerId).emit('ability-choice-required', {
+        emitTriggeredChoice(room, trigger.playerId, {
             roomId,
             message: `${trigger.sourceBaseName}: move one of your minions to another base?`,
             choices: [
@@ -4490,7 +5128,7 @@ function processNextTriggeredAbility(room, roomId) {
             sourceCardType: trigger.sourceCardType,
             useKey: trigger.useKey
         };
-        io.to(trigger.playerId).emit('ability-choice-required', {
+        emitTriggeredChoice(room, trigger.playerId, {
             roomId,
             message: `Move ${minion.name} instead of destroying it?`,
             choices: [
@@ -4513,7 +5151,7 @@ function processNextTriggeredAbility(room, roomId) {
             playerId: trigger.playerId,
             sourceCardName: trigger.sourceCardName
         };
-        io.to(trigger.playerId).emit('ability-choice-required', {
+        emitTriggeredChoice(room, trigger.playerId, {
             roomId,
             message: `${trigger.sourceCardName}: draw a card?`,
             choices: [
@@ -4823,8 +5461,9 @@ function resolveTriggeredAbilityChoice(room, roomId, socket, choice) {
         if (choice?.choiceId !== 'accept' && choice?.choiceId !== 'skip') return false;
         if (choice.choiceId === 'accept') {
             const player = room.players.find(candidate => candidate.id === socket.id);
-            if (player?.deck.length) {
-                player.hand.push(player.deck.shift());
+            const card = drawPlayerCard(room, player);
+            if (card) {
+                player.hand.push(card);
                 addBattleLog(room, `**${player.name}** draws a card with **${pendingAbility.sourceCardName}**.`);
             }
         }
@@ -4889,18 +5528,36 @@ function emitGameState(roomId, room) {
         currentTurnPlayerId: room.currentTurnPlayerId,
         turnState: room.turnState,
         gamePhase: room.gamePhase,
-        battleLog: room.battleLog
+        battleLog: room.battleLog,
+        gameResult: room.gameResult || null
     });
-    botTurnController.wake(roomId);
+    if (room.gamePhase === 'finished') botTurnController.stop(roomId);
+    else botTurnController.wake(roomId);
 }
 
-function shuffleDeck(deck) {
+function shuffleDeck(deck, random = systemRandom) {
     for (let index = deck.length - 1; index > 0; index--) {
-        const randomIndex = Math.floor(Math.random() * (index + 1));
+        const randomIndex = Math.floor(random() * (index + 1));
         [deck[index], deck[randomIndex]] = [deck[randomIndex], deck[index]];
     }
 
     return deck;
+}
+
+function replenishBaseDeck(room) {
+    if (!room || room.baseDeck?.length > 0 || !room.baseDiscardPile?.length) return false;
+
+    room.baseDeck = room.baseDiscardPile.splice(0);
+    shuffleDeck(room.baseDeck, () => nextSeededRandom(room));
+    addBattleLog(room, '**The base discard pile** is shuffled to form a new base deck.');
+    return true;
+}
+
+function drawReplacementBase(room) {
+    if (!room.baseDeck) room.baseDeck = [];
+    if (!room.baseDiscardPile) room.baseDiscardPile = [];
+    replenishBaseDeck(room);
+    return room.baseDeck.shift() || null;
 }
 
 function generateDraftOrder(players) {
@@ -4939,6 +5596,7 @@ function getScoringBases(room) {
 function scoreBase(room, baseIndex) {
     recalculateOngoingEffects(room);
     const base = room.activeBases[baseIndex];
+    if (!base) return false;
 
     // 1. Calculate power per player on this base
     const powerPerPlayer = {}; // playerId -> totalPower
@@ -5018,9 +5676,13 @@ function scoreBase(room, baseIndex) {
         });
     }
 
-    // 4. Replace scored base with a new one from the base deck (if available)
-    if (room.baseDeck && room.baseDeck.length > 0) {
-        const newBase = room.baseDeck.shift();
+    // 4. Discard the scored base, reshuffling the base discard pile if needed,
+    // then immediately replace it so the number of active bases stays constant.
+    base.playedCards = [];
+    if (!room.baseDiscardPile) room.baseDiscardPile = [];
+    room.baseDiscardPile.push(base);
+    const newBase = drawReplacementBase(room);
+    if (newBase) {
         room.activeBases[baseIndex] = {
             ...newBase,
             playedCards: []
@@ -5065,6 +5727,7 @@ function scoreBase(room, baseIndex) {
     getPlayersInTurnOrder(room).forEach(player => {
         room.triggerQueue.push(...(triggersByPlayer.get(player.id) || []));
     });
+    return true;
 }
 
 function holdScoredMinion(room, minion) {
@@ -5170,6 +5833,9 @@ if (require.main === module) {
 }
 
 module.exports = {
+    BOT_POLICY_VERSIONS,
+    DEFAULT_BOT_POLICY_VERSION,
+    MAX_HAND_SIZE,
     MAX_PLAYERS,
     activateTalent,
     addLobbyBot,
@@ -5178,6 +5844,10 @@ module.exports = {
     baseAbilitiesAreCancelled,
     clearTemporaryEffects,
     chooseDefaultBotAction,
+    chooseDefaultBotActionIndex,
+    chooseConfiguredBotActionIndex,
+    chooseGreedyHeuristic1ActionIndex,
+    chooseGreedyHeuristic2ActionIndex,
     createBotTurnController,
     createInitialTurnState,
     executeDraftFactionAction,
@@ -5186,8 +5856,14 @@ module.exports = {
     executePlayCardAction,
     executeResolveAbilityChoiceAction,
     executeUseTalentAction,
+    exportRoomTrajectoryJson,
+    finishGameIfNeeded,
+    finalizeRoomTrajectory,
+    getCompletedGameResult,
     getLegalActions,
     getBotDecisionActorId,
+    getPlayerObservation,
+    getRoomTrajectory,
     getOngoingDiscardPlayBaseIndices,
     isMinionPlayPrevented,
     isMinionProtectedFromCard,
@@ -5198,6 +5874,7 @@ module.exports = {
     queueBeforeBaseScoringSpecials,
     queueRevealedDeckSelection,
     queueSelectedPlayerBoardEffect,
+    recordTrajectoryDecision,
     recalculateOngoingEffects,
     resolveEndTurnActions,
     resolveDeckReorder,

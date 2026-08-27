@@ -15,6 +15,17 @@ const DEFAULT_TURN_STATE = {
   talentUses: {}
 };
 const MINION_TARGETING_MODES = ['ally-minion', 'enemy-minion', 'neutral-minion'];
+const BOT_POLICY_OPTIONS = [
+  { value: 'random-v1', label: 'Random' },
+  { value: 'greedy_heuristic_1', label: 'Greedy heuristic 1' },
+  { value: 'greedy_heuristic_2', label: 'Greedy heuristic 2' }
+];
+const BOT_POLICY_LABELS = Object.fromEntries(BOT_POLICY_OPTIONS.map(option => [option.value, option.label]));
+const getPlayerDisplayName = player => (
+  `${player.name}${player.isBot
+    ? ` (${(BOT_POLICY_LABELS[player.policyVersion] || 'Random').toLowerCase()})`
+    : ''}`
+);
 const socket = io(SOCKET_URL);
 
 function CardLogButton({ card, onCardClick }) {
@@ -253,6 +264,7 @@ function App() {
   const [currentTurnPlayerId, setCurrentTurnPlayerId] = useState(null);
   const [turnState, setTurnState] = useState(DEFAULT_TURN_STATE);
   const [battleLog, setBattleLog] = useState([]);
+  const [gameResult, setGameResult] = useState(null);
   const [chatMessages, setChatMessages] = useState([]);
   const [myHand, setMyHand] = useState([]);
   const [myDiscard, setMyDiscard] = useState([]);
@@ -266,6 +278,7 @@ function App() {
   const [abilityChoice, setAbilityChoice] = useState(null);
   const [selectedAbilityChoiceIds, setSelectedAbilityChoiceIds] = useState([]);
   const [chatDraft, setChatDraft] = useState('');
+  const [selectedBotPolicy, setSelectedBotPolicy] = useState('greedy_heuristic_1');
   const chatScrollRef = useRef(null);
 
   useEffect(() => {
@@ -296,7 +309,8 @@ function App() {
       draftState,
       currentTurnPlayerId,
       turnState,
-      battleLog
+      battleLog,
+      gameResult
     }) => {
       setCurrentRoom(roomId);
       setPlayers(players);
@@ -306,6 +320,7 @@ function App() {
       if (currentTurnPlayerId) setCurrentTurnPlayerId(currentTurnPlayerId);
       if (turnState) setTurnState(turnState);
       if (battleLog) setBattleLog(battleLog);
+      if (gameResult) setGameResult(gameResult);
       setIsHost(false);
       setIsSpectator(true);
       setGamePhase(gamePhase || 'playing');
@@ -338,7 +353,7 @@ function App() {
       setDraftState(draftState);
     });
 
-    socket.on('game-started', ({ roomId, players, activeBases, spectators, currentTurnPlayerId, turnState, gamePhase, battleLog }) => {
+    socket.on('game-started', ({ roomId, players, activeBases, spectators, currentTurnPlayerId, turnState, gamePhase, battleLog, gameResult }) => {
       if (roomId) setCurrentRoom(roomId);
       setGamePhase(gamePhase || 'playing');
       setPlayers(players);
@@ -350,6 +365,7 @@ function App() {
       if (currentTurnPlayerId) setCurrentTurnPlayerId(currentTurnPlayerId);
       if (turnState) setTurnState(turnState);
       if (battleLog) setBattleLog(battleLog);
+      if (gameResult) setGameResult(gameResult);
 
       const me = players.find(p => p.id === socket.id);
       if (me) {
@@ -358,17 +374,18 @@ function App() {
       }
     });
 
-    socket.on('game-state-update', ({ players, activeBases, currentTurnPlayerId, turnState, spectators, gamePhase, battleLog }) => {
+    socket.on('game-state-update', ({ players, activeBases, currentTurnPlayerId, turnState, spectators, gamePhase, battleLog, gameResult }) => {
       if (gamePhase) setGamePhase(gamePhase);
       setPlayers(players);
       if (activeBases) setActiveBases(activeBases);
-      if (currentTurnPlayerId) setCurrentTurnPlayerId(currentTurnPlayerId);
+      if (currentTurnPlayerId !== undefined) setCurrentTurnPlayerId(currentTurnPlayerId);
       if (turnState) setTurnState(turnState);
       if (spectators) {
         setSpectators(spectators);
         setIsSpectator(spectators.some(spectator => spectator.id === socket.id));
       }
       if (battleLog) setBattleLog(battleLog);
+      if (gameResult) setGameResult(gameResult);
 
       const me = players.find(p => p.id === socket.id);
       if (me) {
@@ -443,6 +460,7 @@ function App() {
     setCurrentTurnPlayerId(null);
     setTurnState(DEFAULT_TURN_STATE);
     setBattleLog([]);
+    setGameResult(null);
     setChatMessages([]);
     setChatDraft('');
     setSelectedCardDetail(null);
@@ -469,7 +487,7 @@ function App() {
   };
 
   const handleAddBot = () => {
-    socket.emit('add-bot', { roomId: currentRoom });
+    socket.emit('add-bot', { roomId: currentRoom, policyVersion: selectedBotPolicy });
   };
 
   const handleRemoveBot = (botId) => {
@@ -530,6 +548,64 @@ function App() {
     resetAppToLobby();
   };
 
+  if (gamePhase === 'finished') {
+    const standings = gameResult?.standings || [...players]
+      .sort((left, right) => (right.vp || 0) - (left.vp || 0))
+      .map((player, index) => ({
+        rank: index + 1,
+        playerId: player.id,
+        name: player.name,
+        vp: player.vp || 0,
+        factions: player.factions || [],
+        isBot: player.isBot === true
+      }));
+
+    return (
+      <div style={{ minHeight: '100vh', padding: '50px 20px', boxSizing: 'border-box', fontFamily: 'Arial, sans-serif', background: 'linear-gradient(135deg, #f8f4df, #dceeff)' }}>
+        <div style={{ maxWidth: '720px', margin: '0 auto', background: 'white', borderRadius: '14px', padding: '32px', boxShadow: '0 10px 30px rgba(0,0,0,0.15)' }}>
+          <div style={{ textAlign: 'center', marginBottom: '28px' }}>
+            <div style={{ fontSize: '54px' }}>🏆</div>
+            <h1 style={{ margin: '8px 0', color: '#2c3e50' }}>Game Over</h1>
+            <h2 style={{ margin: 0, color: '#b8860b' }}>
+              {gameResult?.winnerName || standings[0]?.name || 'The winner'} wins!
+            </h2>
+            <p style={{ color: '#555' }}>
+              Room {currentRoom} · {gameResult?.winningVictoryPoints ?? standings[0]?.vp ?? 0} victory points
+            </p>
+          </div>
+
+          <h3 style={{ borderBottom: '2px solid #ddd', paddingBottom: '8px' }}>Final Standings</h3>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
+            {standings.map(standing => (
+              <div
+                key={standing.playerId}
+                style={{ display: 'grid', gridTemplateColumns: '55px 1fr auto', gap: '12px', alignItems: 'center', padding: '14px', borderRadius: '8px', background: standing.playerId === gameResult?.winnerId ? '#fff3bf' : '#f4f4f4', border: standing.playerId === gameResult?.winnerId ? '2px solid #e0b400' : '1px solid #ddd' }}
+              >
+                <strong style={{ fontSize: '20px', textAlign: 'center' }}>#{standing.rank}</strong>
+                <div>
+                  <strong>{standing.name}</strong>
+                  {standing.playerId === socket.id ? ' (You)' : ''}
+                  {standing.isBot ? ' 🤖' : ''}
+                  <div style={{ color: '#666', fontSize: '12px', marginTop: '3px' }}>
+                    {(standing.factions || []).join(' & ') || 'No factions'}
+                  </div>
+                </div>
+                <strong style={{ color: '#b33', fontSize: '18px' }}>{standing.vp} VP</strong>
+              </div>
+            ))}
+          </div>
+
+          <button
+            onClick={handleLeaveRoom}
+            style={{ display: 'block', margin: '28px auto 0', padding: '11px 22px', border: 'none', borderRadius: '6px', background: '#286090', color: 'white', fontSize: '16px', cursor: 'pointer' }}
+          >
+            Return to Lobby
+          </button>
+        </div>
+      </div>
+    );
+  }
+
   // --- 1. SPECTATOR SCREEN ---
   if (isSpectator && (gamePhase === 'playing' || gamePhase === 'scoring')) {
     return (
@@ -545,7 +621,7 @@ function App() {
             <ul>
               {players.map((p, index) => (
                 <li key={index} style={{ marginBottom: '10px' }}>
-                  <strong>{p.name}</strong> {p.id === currentTurnPlayerId ? '⭐ (Active Turn)' : ''}
+                  <strong>{getPlayerDisplayName(p)}</strong> {p.id === currentTurnPlayerId ? '⭐ (Active Turn)' : ''}
                   <div style={{ fontSize: '12px', color: '#444' }}>
                     Factions: {p.factions ? p.factions.join(' & ') : 'Drafting...'}
                   </div>
@@ -716,7 +792,7 @@ function App() {
             <ul>
               {players.map((p) => (
                 <li key={p.id} style={{ marginBottom: '8px' }}>
-                  <strong>{p.name} {p.id === socket.id ? '(You)' : ''}:</strong>{' '}
+                  <strong>{getPlayerDisplayName(p)} {p.id === socket.id ? '(You)' : ''}:</strong>{' '}
                   {draftState?.picks[p.id]?.length > 0
                     ? draftState.picks[p.id].join(' + ')
                     : '<em>No picks yet</em>'}
@@ -868,7 +944,7 @@ function App() {
                   const playerVp = p.vp !== undefined ? p.vp : 0;
                   return (
                     <li key={index} style={{ marginBottom: '12px', borderBottom: '1px solid #ddd', paddingBottom: '8px' }}>
-                      <strong>{p.name}</strong> {isMe ? '(You)' : ''} {p.id === currentTurnPlayerId ? '⭐' : ''}
+                      <strong>{getPlayerDisplayName(p)}</strong> {isMe ? '(You)' : ''} {p.id === currentTurnPlayerId ? '⭐' : ''}
                       <div style={{ fontSize: '13px', fontWeight: 'bold', color: '#d9534f', margin: '2px 0' }}>
                         🏆 Victory Points (VP): {playerVp}
                       </div>
@@ -1785,7 +1861,7 @@ function App() {
             {players.map((p, index) => (
               <li key={p.id || index}>
                 {p.name} {p.id === socket.id ? '(You)' : ''}
-                {p.isBot ? ' 🤖 (Bot)' : ''}
+                {p.isBot ? ` 🤖 (Bot: ${BOT_POLICY_LABELS[p.policyVersion] || 'Random'})` : ''}
                 {p.id === hostId ? ' 👑 (Host)' : ''}
                 {isHost && p.isBot && (
                   <button
@@ -1815,12 +1891,25 @@ function App() {
           {isHost ? (
             <div style={{ marginTop: '20px' }}>
               {players.length < 4 && (
-                <button
-                  onClick={handleAddBot}
-                  style={{ padding: '10px 20px', fontSize: '16px', backgroundColor: '#286090', color: 'white', cursor: 'pointer', marginRight: '10px' }}
-                >
-                  Add Bot
-                </button>
+                <>
+                  <label style={{ marginRight: '8px' }} htmlFor="bot-policy">Bot strategy:</label>
+                  <select
+                    id="bot-policy"
+                    value={selectedBotPolicy}
+                    onChange={(event) => setSelectedBotPolicy(event.target.value)}
+                    style={{ marginRight: '8px', padding: '9px' }}
+                  >
+                    {BOT_POLICY_OPTIONS.map(option => (
+                      <option key={option.value} value={option.value}>{option.label}</option>
+                    ))}
+                  </select>
+                  <button
+                    onClick={handleAddBot}
+                    style={{ padding: '10px 20px', fontSize: '16px', backgroundColor: '#286090', color: 'white', cursor: 'pointer', marginRight: '10px' }}
+                  >
+                    Add Bot
+                  </button>
+                </>
               )}
               <button
                 onClick={handleStartGame}

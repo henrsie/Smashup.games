@@ -1,5 +1,7 @@
 // backend/factions.js
 
+const { systemRandom } = require('./random.js');
+
 const factionsData = {
   Dinosaurs: {
     name: "Dinosaurs",
@@ -253,7 +255,7 @@ for (const faction of Object.values(factionsData)) {
   }
 }
 
-function buildFactionDeck(factionKey) {
+function buildFactionDeck(factionKey, random = systemRandom) {
   const faction = factionsData[factionKey];
   if (!faction) return [];
 
@@ -261,7 +263,7 @@ function buildFactionDeck(factionKey) {
   faction.cards.forEach(cardTemplate => {
     for (let i = 0; i < cardTemplate.count; i++) {
       deck.push({
-        instanceId: `${cardTemplate.id}_${Math.random().toString(36).substr(2, 5)}`,
+        instanceId: `${cardTemplate.id}_${random().toString(36).slice(2, 7)}`,
         cardId: cardTemplate.id,
         name: cardTemplate.name,
         type: cardTemplate.type,

@@ -1,6 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const {
+    BOT_POLICY_VERSIONS,
     MAX_PLAYERS,
     addLobbyBot,
     addLobbyParticipant,
@@ -65,7 +66,8 @@ test('the host can add numbered bots as normal player seats in creation order', 
             deck: [],
             discardPile: [],
             online: true,
-            isBot: true
+            isBot: true,
+            policyVersion: BOT_POLICY_VERSIONS.RANDOM
         },
         {
             id: 'bot-ROOM1-2',
@@ -74,9 +76,34 @@ test('the host can add numbered bots as normal player seats in creation order', 
             deck: [],
             discardPile: [],
             online: true,
-            isBot: true
+            isBot: true,
+            policyVersion: BOT_POLICY_VERSIONS.RANDOM
         }
     ]);
+});
+
+test('the host can add bots with different supported policies', () => {
+    const room = createLobby(1);
+
+    const result = addLobbyBot(
+        room,
+        'player-1',
+        'ROOM1',
+        BOT_POLICY_VERSIONS.GREEDY_HEURISTIC_1
+    );
+    const secondResult = addLobbyBot(
+        room,
+        'player-1',
+        'ROOM1',
+        BOT_POLICY_VERSIONS.GREEDY_HEURISTIC_2
+    );
+    const invalidResult = addLobbyBot(room, 'player-1', 'ROOM1', 'unknown-policy');
+
+    assert.equal(result.ok, true);
+    assert.equal(result.participant.policyVersion, BOT_POLICY_VERSIONS.GREEDY_HEURISTIC_1);
+    assert.equal(secondResult.ok, true);
+    assert.equal(secondResult.participant.policyVersion, BOT_POLICY_VERSIONS.GREEDY_HEURISTIC_2);
+    assert.equal(invalidResult.code, 'invalid_bot_policy');
 });
 
 test('only the host can add a bot', () => {

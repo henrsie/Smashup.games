@@ -1,13 +1,25 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { factionsData } = require('./factions.js');
+const { initializeSeededRandom, nextSeededRandom } = require('./random.js');
 const {
+    MAX_HAND_SIZE,
     chooseDefaultBotAction,
+    chooseDefaultBotActionIndex,
     createBotTurnController,
     createInitialTurnState,
+    executeDraftFactionAction,
     executeGameAction,
+    exportRoomTrajectoryJson,
+    finishGameIfNeeded,
+    finalizeRoomTrajectory,
     getBotDecisionActorId,
+    getCompletedGameResult,
     getLegalActions,
+    getPlayerObservation,
+    getRoomTrajectory,
+    recordTrajectoryDecision,
+    scoreBase,
     validatePlayCardAction
 } = require('./server.js');
 
@@ -27,7 +39,7 @@ function createCard(cardId, ownerId, instanceId = `${cardId}-instance`) {
 }
 
 function createRoom(actorId = 'bot-1') {
-    return {
+    const room = {
         activeBases: [
             {
                 id: 'test-base',
@@ -38,6 +50,8 @@ function createRoom(actorId = 'bot-1') {
                 playedCards: []
             }
         ],
+        baseDeck: [],
+        baseDiscardPile: [],
         battleLog: [],
         currentTurnPlayerId: actorId,
         gamePhase: 'playing',
@@ -64,6 +78,8 @@ function createRoom(actorId = 'bot-1') {
         triggerQueue: [],
         turnState: createInitialTurnState()
     };
+    initializeSeededRandom(room, 123456);
+    return room;
 }
 
 function createScheduledBotController(room) {
@@ -353,6 +369,261 @@ test('a bot-style actor ends a normal turn through the shared dispatcher', () =>
     assert.equal(stateEmissions, 1);
 });
 
+test('end-turn draws recycle an empty deck from the discard pile', () => {
+    const room = createRoom();
+    const bot = room.players[0];
+    bot.discardPile.push(
+        createCard('dino_king_1', 'bot-1', 'recycled-1'),
+        createCard('dino_armor_1', 'bot-1', 'recycled-2')
+    );
+
+    const result = executeGameAction({
+        room,
+        roomId: 'ROOM1',
+        actorId: 'bot-1',
+        action: { type: 'end-turn' }
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(bot.deck.length, 0);
+    assert.equal(bot.discardPile.length, 0);
+    assert.deepEqual(
+        new Set(bot.hand.map(card => card.instanceId)),
+        new Set(['recycled-1', 'recycled-2'])
+    );
+    assert.ok(room.battleLog.some(entry => (
+        entry === '**Bot One** shuffles their discard pile to form a new deck.'
+    )));
+});
+
+test('a bot must discard down to the ten-card hand limit before the next turn', () => {
+    const room = createRoom();
+    const bot = room.players[0];
+    bot.isBot = true;
+    bot.hand = Array.from({ length: MAX_HAND_SIZE }, (_, index) => (
+        createCard('dino_king_1', 'bot-1', `hand-${index}`)
+    ));
+    bot.deck = [
+        createCard('dino_armor_1', 'bot-1', 'draw-1'),
+        createCard('dino_bro_1', 'bot-1', 'draw-2')
+    ];
+
+    const endTurnResult = executeGameAction({
+        room,
+        roomId: 'ROOM1',
+        actorId: 'bot-1',
+        action: { type: 'end-turn' }
+    });
+
+    assert.equal(endTurnResult.ok, true);
+    assert.equal(endTurnResult.turnCompleted, false);
+    assert.equal(room.currentTurnPlayerId, 'bot-1');
+    assert.equal(room.pendingAbility.type, 'handLimitDiscard');
+    assert.equal(room.pendingAbility.cardsRemaining, 2);
+    assert.equal(bot.hand.length, 12);
+    assert.equal(getLegalActions(room, 'bot-1').length, 12);
+
+    const firstDiscard = getLegalActions(room, 'bot-1')[0];
+    const firstDiscardResult = executeGameAction({
+        room,
+        roomId: 'ROOM1',
+        actorId: 'bot-1',
+        action: firstDiscard
+    });
+
+    assert.equal(firstDiscardResult.ok, true);
+    assert.equal(bot.hand.length, 11);
+    assert.equal(bot.discardPile.length, 1);
+    assert.equal(room.pendingAbility.cardsRemaining, 1);
+    assert.equal(room.currentTurnPlayerId, 'bot-1');
+
+    const secondDiscard = getLegalActions(room, 'bot-1')[0];
+    const secondDiscardResult = executeGameAction({
+        room,
+        roomId: 'ROOM1',
+        actorId: 'bot-1',
+        action: secondDiscard
+    });
+
+    assert.equal(secondDiscardResult.ok, true);
+    assert.equal(bot.hand.length, MAX_HAND_SIZE);
+    assert.equal(bot.discardPile.length, 2);
+    assert.equal(room.pendingAbility, null);
+    assert.equal(room.currentTurnPlayerId, 'human-1');
+    assert.match(room.battleLog[1], /discards.*to meet the hand limit/);
+});
+
+test('human players may temporarily exceed the hand limit for playtesting', () => {
+    const room = createRoom('human-player');
+    const human = room.players[0];
+    human.hand = Array.from({ length: MAX_HAND_SIZE }, (_, index) => (
+        createCard('dino_king_1', human.id, `human-hand-${index}`)
+    ));
+    human.deck = [
+        createCard('dino_armor_1', human.id, 'human-draw-1'),
+        createCard('dino_bro_1', human.id, 'human-draw-2')
+    ];
+
+    const result = executeGameAction({
+        room,
+        roomId: 'ROOM1',
+        actorId: human.id,
+        action: { type: 'end-turn' }
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(result.turnCompleted, true);
+    assert.equal(human.hand.length, 12);
+    assert.equal(room.pendingAbility, null);
+    assert.equal(room.currentTurnPlayerId, 'human-1');
+});
+
+test('a scoring bot turn also waits for hand-limit discards', () => {
+    const room = createRoom();
+    const bot = room.players[0];
+    bot.isBot = true;
+    bot.hand = Array.from({ length: MAX_HAND_SIZE }, (_, index) => (
+        createCard('dino_king_1', bot.id, `scoring-hand-${index}`)
+    ));
+    bot.deck = [
+        createCard('dino_armor_1', bot.id, 'scoring-draw-1'),
+        createCard('dino_bro_1', bot.id, 'scoring-draw-2')
+    ];
+    room.activeBases[0].breakpoint = 1;
+    room.activeBases[0].playedCards.push(createCard('dino_king_1', bot.id, 'scoring-minion'));
+    room.baseDeck = [];
+    let finishScoring;
+
+    executeGameAction({
+        room,
+        roomId: 'ROOM1',
+        actorId: bot.id,
+        action: { type: 'end-turn' },
+        scheduleAction: callback => { finishScoring = callback; }
+    });
+    finishScoring();
+
+    assert.equal(room.gamePhase, 'scoring');
+    assert.equal(room.currentTurnPlayerId, bot.id);
+    assert.equal(room.pendingAbility.type, 'handLimitDiscard');
+    assert.equal(room.pendingAbility.cardsRemaining, 2);
+    assert.equal(bot.hand.length, 12);
+});
+
+test('ending a turn finishes the game for a unique leader with at least 15 VP', () => {
+    const room = createRoom();
+    room.players[0].vp = 15;
+
+    const result = executeGameAction({
+        room,
+        roomId: 'ROOM1',
+        actorId: 'bot-1',
+        action: { type: 'end-turn' }
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(result.gameFinished, true);
+    assert.equal(room.gamePhase, 'finished');
+    assert.equal(room.currentTurnPlayerId, null);
+    assert.equal(room.gameResult.winnerId, 'bot-1');
+    assert.equal(room.gameResult.standings[0].vp, 15);
+    assert.match(room.battleLog[0], /Bot One.*wins the game/);
+});
+
+test('leaders tied at 15 or more VP continue playing', () => {
+    const room = createRoom();
+    room.players[0].vp = 15;
+    room.players[1].vp = 15;
+    let stopped = false;
+
+    assert.equal(getCompletedGameResult(room), null);
+    assert.equal(finishGameIfNeeded(room, 'ROOM1', {
+        stopBotController: () => { stopped = true; }
+    }), null);
+    assert.equal(room.gamePhase, 'playing');
+    assert.equal(stopped, false);
+});
+
+test('finishing a game applies win and loss rewards to pending trajectories', () => {
+    const room = createRoom();
+    room.players[0].vp = 14;
+    room.players[1].vp = 9;
+    const legalActions = [{ type: 'end-turn' }];
+    recordTrajectoryDecision({
+        room,
+        roomId: 'ROOM1',
+        playerId: 'bot-1',
+        observation: getPlayerObservation(room, 'bot-1'),
+        legalActions,
+        chosenAction: legalActions[0]
+    });
+    recordTrajectoryDecision({
+        room,
+        roomId: 'ROOM1',
+        playerId: 'human-1',
+        observation: getPlayerObservation(room, 'human-1'),
+        legalActions,
+        chosenAction: legalActions[0]
+    });
+    room.players[0].vp = 15;
+    let stoppedRoomId = null;
+
+    const result = finishGameIfNeeded(room, 'ROOM1', {
+        stopBotController: roomId => { stoppedRoomId = roomId; }
+    });
+    const trajectory = getRoomTrajectory(room);
+    const winnerEntry = trajectory.entries.find(entry => entry.playerId === 'bot-1');
+    const loserEntry = trajectory.entries.find(entry => entry.playerId === 'human-1');
+
+    assert.equal(result.winnerId, 'bot-1');
+    assert.equal(stoppedRoomId, 'ROOM1');
+    assert.equal(winnerEntry.vpReward, 1);
+    assert.equal(winnerEntry.terminalReward, 1);
+    assert.equal(winnerEntry.reward, 2);
+    assert.equal(winnerEntry.terminated, true);
+    assert.equal(loserEntry.vpReward, 0);
+    assert.equal(loserEntry.terminalReward, -1);
+    assert.equal(loserEntry.reward, -1);
+    assert.equal(loserEntry.done, true);
+    assert.equal(trajectory.metadata.terminationReason, 'victory');
+    assert.equal(trajectory.metadata.terminated, true);
+    assert.equal(trajectory.metadata.gameResult.winnerId, 'bot-1');
+});
+
+test('a synchronously recorded final action receives the terminal reward exactly once', () => {
+    const room = createRoom();
+    room.players[0].vp = 14;
+    const legalActions = [{ type: 'end-turn' }];
+    recordTrajectoryDecision({
+        room,
+        roomId: 'ROOM1',
+        playerId: 'bot-1',
+        observation: getPlayerObservation(room, 'bot-1'),
+        legalActions,
+        chosenAction: legalActions[0]
+    });
+    room.players[0].vp = 15;
+    const finalActionObservation = getPlayerObservation(room, 'bot-1');
+
+    finishGameIfNeeded(room, 'ROOM1', { stopBotController: () => {} });
+    recordTrajectoryDecision({
+        room,
+        roomId: 'ROOM1',
+        playerId: 'bot-1',
+        observation: finalActionObservation,
+        legalActions,
+        chosenAction: legalActions[0]
+    });
+
+    const trajectory = getRoomTrajectory(room);
+    assert.equal(trajectory.entries[0].terminalReward, 0);
+    assert.equal(trajectory.entries[0].terminated, false);
+    assert.equal(trajectory.entries[0].nextObservation.gamePhase, 'playing');
+    assert.equal(trajectory.entries[1].terminalReward, 1);
+    assert.equal(trajectory.entries[1].terminated, true);
+    assert.equal(trajectory.entries.reduce((sum, entry) => sum + entry.terminalReward, 0), 1);
+});
+
 test('a scoring end-turn returns its room event and completes through an injected scheduler', () => {
     const room = createRoom();
     const kingRex = createCard('dino_king_1', 'bot-1');
@@ -400,6 +671,121 @@ test('a scoring end-turn returns its room event and completes through an injecte
     assert.equal(stateEmissions, 1);
 });
 
+test('a scoring turn finishes after all scoring awards produce a unique 15 VP leader', () => {
+    const room = createRoom();
+    room.players[0].vp = 12;
+    const kingRex = createCard('dino_king_1', 'bot-1');
+    room.activeBases[0].breakpoint = 1;
+    room.activeBases[0].playedCards.push(kingRex);
+    room.baseDeck = [];
+    let scheduledResolution = null;
+
+    const result = executeGameAction({
+        room,
+        roomId: 'ROOM1',
+        actorId: 'bot-1',
+        action: { type: 'end-turn' },
+        scheduleAction: callback => { scheduledResolution = callback; }
+    });
+    assert.equal(result.ok, true);
+    assert.equal(room.gamePhase, 'scoring');
+
+    scheduledResolution();
+
+    assert.equal(room.players[0].vp, 15);
+    assert.equal(room.gamePhase, 'finished');
+    assert.equal(room.currentTurnPlayerId, null);
+    assert.equal(room.gameResult.winnerId, 'bot-1');
+});
+
+test('multiple bases score by stable identity while empty base decks recycle', () => {
+    const room = createRoom();
+    room.activeBases = [
+        {
+            id: 'scoring-base-one',
+            name: 'Scoring Base One',
+            breakpoint: 1,
+            vp: [3, 2, 1],
+            abilities: [],
+            playedCards: [createCard('dino_king_1', 'bot-1', 'base-one-minion')]
+        },
+        {
+            id: 'scoring-base-two',
+            name: 'Scoring Base Two',
+            breakpoint: 1,
+            vp: [3, 2, 1],
+            abilities: [],
+            playedCards: [createCard('dino_armor_1', 'bot-1', 'base-two-minion')]
+        }
+    ];
+    room.baseDeck = [];
+    let finishScoring;
+
+    const result = executeGameAction({
+        room,
+        roomId: 'ROOM1',
+        actorId: 'bot-1',
+        action: { type: 'end-turn' },
+        scheduleAction: callback => { finishScoring = callback; }
+    });
+
+    assert.deepEqual(result.scoringBases, [0, 1]);
+    assert.doesNotThrow(() => finishScoring());
+    assert.equal(room.players[0].vp, 6);
+    assert.equal(room.players[0].discardPile.length, 0);
+    assert.deepEqual(
+        new Set(room.players[0].hand.map(card => card.instanceId)),
+        new Set(['base-one-minion', 'base-two-minion'])
+    );
+    assert.equal(room.activeBases.length, 2);
+    assert.deepEqual(
+        room.activeBases.map(base => base.id),
+        ['scoring-base-one', 'scoring-base-two']
+    );
+    assert.equal(room.baseDeck.length, 0);
+    assert.equal(room.baseDiscardPile.length, 0);
+    assert.equal(room.currentTurnPlayerId, 'human-1');
+});
+
+test('base discard reshuffles are reproducible from the room seed', () => {
+    const runRecycle = () => {
+        const room = createRoom();
+        initializeSeededRandom(room, 98765);
+        room.activeBases[0] = {
+            id: 'scored-base',
+            name: 'Scored Base',
+            breakpoint: 1,
+            vp: [3, 2, 1],
+            abilities: [],
+            playedCards: [createCard('dino_king_1', 'bot-1', 'scoring-minion')]
+        };
+        room.baseDiscardPile = [
+            { id: 'discarded-base-1', name: 'Discarded Base 1', breakpoint: 20, vp: [3, 2, 1], abilities: [], playedCards: [] },
+            { id: 'discarded-base-2', name: 'Discarded Base 2', breakpoint: 20, vp: [3, 2, 1], abilities: [], playedCards: [] }
+        ];
+
+        scoreBase(room, 0);
+        return {
+            activeBaseIds: room.activeBases.map(base => base.id),
+            baseDeckIds: room.baseDeck.map(base => base.id),
+            baseDiscardIds: room.baseDiscardPile.map(base => base.id),
+            randomState: room.randomState
+        };
+    };
+
+    const first = runRecycle();
+    const second = runRecycle();
+
+    assert.deepEqual(first, second);
+    assert.equal(first.activeBaseIds.length, 1);
+    assert.equal(first.baseDeckIds.length, 2);
+    assert.equal(first.baseDiscardIds.length, 0);
+    assert.deepEqual(
+        new Set([...first.activeBaseIds, ...first.baseDeckIds]),
+        new Set(['scored-base', 'discarded-base-1', 'discarded-base-2'])
+    );
+});
+
 test('a bot-style actor completes its faction draft through the shared dispatcher', () => {
     const room = {
         battleLog: [],
@@ -422,6 +808,7 @@ test('a bot-style actor completes its faction draft through the shared dispatche
         spectators: [],
         temporaryEffects: []
     };
+    initializeSeededRandom(room, 8675309);
 
     const firstPick = executeGameAction({
         room,
@@ -450,6 +837,65 @@ test('a bot-style actor completes its faction draft through the shared dispatche
     assert.deepEqual(room.players[0].factions, ['Aliens', 'Dinosaurs']);
     assert.equal(room.players[0].hand.length, 5);
     assert.equal(room.activeBases.length, 3);
+});
+
+test('the same room seed reproduces drafted decks, opening hands, and bases', () => {
+    const createDraftRoom = () => {
+        const room = {
+            battleLog: [],
+            draftState: {
+                availableFactions: Object.keys(factionsData),
+                currentTurnIndex: 0,
+                draftOrder: ['bot-1', 'bot-1'],
+                picks: { 'bot-1': [] }
+            },
+            gamePhase: 'drafting',
+            pendingAbility: null,
+            players: [{
+                id: 'bot-1',
+                name: 'Bot One',
+                hand: [],
+                deck: [],
+                discardPile: [],
+                vp: 0
+            }],
+            spectators: [],
+            temporaryEffects: []
+        };
+        initializeSeededRandom(room, 'replayable-game');
+        return room;
+    };
+    const finishDraft = room => {
+        executeDraftFactionAction({
+            room,
+            actorId: 'bot-1',
+            action: { type: 'draft-faction', factionName: 'Aliens' }
+        });
+        executeDraftFactionAction({
+            room,
+            actorId: 'bot-1',
+            action: { type: 'draft-faction', factionName: 'Dinosaurs' }
+        });
+    };
+    const firstRoom = createDraftRoom();
+    const secondRoom = createDraftRoom();
+
+    finishDraft(firstRoom);
+    finishDraft(secondRoom);
+
+    assert.deepEqual(
+        firstRoom.activeBases.map(base => base.id),
+        secondRoom.activeBases.map(base => base.id)
+    );
+    assert.deepEqual(
+        firstRoom.players[0].hand.map(card => card.instanceId),
+        secondRoom.players[0].hand.map(card => card.instanceId)
+    );
+    assert.deepEqual(
+        firstRoom.players[0].deck.map(card => card.instanceId),
+        secondRoom.players[0].deck.map(card => card.instanceId)
+    );
+    assert.equal(firstRoom.randomState, secondRoom.randomState);
 });
 
 test('getLegalActions returns executable card, Talent, and end-turn actions', () => {
@@ -531,7 +977,7 @@ test('getLegalActions returns only pending ability choices while a choice is unr
     assert.equal(getLegalActions(room, 'human-1').length, 0);
 });
 
-test('getLegalActions stages batch selections and enumerates every deck order', () => {
+test('getLegalActions stages batch selections and deck ordering choices', () => {
     const room = createRoom();
     const minions = [
         createCard('robot_zapbot_1', 'human-1', 'target-1'),
@@ -594,9 +1040,61 @@ test('getLegalActions stages batch selections and enumerates every deck order', 
 
     const reorderActions = getLegalActions(room, 'bot-1');
 
-    assert.equal(reorderActions.length, 6);
-    assert.ok(reorderActions.every(action => action.choice.cardInstanceIds.length === 3));
-    assert.equal(new Set(reorderActions.map(action => action.choice.cardInstanceIds.join(','))).size, 6);
+    assert.equal(reorderActions.length, 3);
+    assert.deepEqual(
+        reorderActions.map(action => action.choice.cardInstanceId),
+        orderedCards.map(card => card.instanceId)
+    );
+
+    executeGameAction({
+        room,
+        roomId: 'ROOM1',
+        actorId: 'bot-1',
+        action: reorderActions[2]
+    });
+    assert.deepEqual(room.pendingAbility.orderedIds, ['order-3']);
+    assert.equal(getLegalActions(room, 'bot-1').length, 2);
+
+    executeGameAction({
+        room,
+        roomId: 'ROOM1',
+        actorId: 'bot-1',
+        action: getLegalActions(room, 'bot-1')[0]
+    });
+    assert.deepEqual(room.pendingAbility.orderedIds, ['order-3', 'order-1']);
+    assert.equal(getLegalActions(room, 'bot-1').length, 1);
+
+    executeGameAction({
+        room,
+        roomId: 'ROOM1',
+        actorId: 'bot-1',
+        action: getLegalActions(room, 'bot-1')[0]
+    });
+    assert.equal(room.pendingAbility, null);
+    assert.deepEqual(
+        room.players[0].deck.map(card => card.instanceId),
+        ['order-3', 'order-1', 'order-2']
+    );
+});
+
+test('large deck orders expose only linear staged policy choices', () => {
+    const room = createRoom();
+    const orderedCards = Array.from({ length: 10 }, (_, index) => (
+        createCard('dino_king_1', 'bot-1', `large-order-${index}`)
+    ));
+    room.players[0].deck = orderedCards;
+    room.pendingAbility = {
+        type: 'deckReorder',
+        playerId: 'bot-1',
+        cardIds: orderedCards.map(card => card.instanceId),
+        orderedIds: []
+    };
+
+    const actions = getLegalActions(room, 'bot-1');
+
+    assert.equal(actions.length, 10);
+    assert.ok(actions.every(action => typeof action.choice.cardInstanceId === 'string'));
+    assert.ok(actions.every(action => action.choice.cardInstanceIds === undefined));
 });
 
 test('getLegalActions keeps any-number card selections linear in candidate count', () => {
@@ -664,20 +1162,235 @@ test('getLegalActions returns all available factions only for the current drafte
     assert.equal(getLegalActions(room, 'human-1').length, 0);
 });
 
-test('the default bot policy chooses a random remaining faction during drafting', () => {
+test('getPlayerObservation exposes public state and only the observer hand', () => {
+    const room = createRoom();
+    const observerCard = createCard('dino_king_1', 'bot-1', 'observer-hand');
+    const opponentCard = createCard('wizard_summon_1', 'human-1', 'opponent-hand');
+    const opponentDeckCard = createCard('wizard_archmage_1', 'human-1', 'opponent-deck');
+    const opponentDiscard = createCard('wizard_scry_1', 'human-1', 'opponent-discard');
+    room.players[0].hand.push(observerCard);
+    room.players[1].hand.push(opponentCard);
+    room.players[1].deck.push(opponentDeckCard);
+    room.players[1].discardPile.push(opponentDiscard);
+    room.battleLog = Array.from({ length: 12 }, (_, index) => `entry-${index}`);
+
+    const observation = getPlayerObservation(room, 'bot-1');
+    const observedSelf = observation.players.find(player => player.id === 'bot-1');
+    const observedOpponent = observation.players.find(player => player.id === 'human-1');
+
+    assert.equal(observation.observerPlayerId, 'bot-1');
+    assert.equal(observation.resolutionId, 'resolution-1');
+    assert.equal(observation.decisionType, 'turnAction');
+    assert.equal(observation.stepIndex, 0);
+    assert.equal(observation.isObserverTurn, true);
+    assert.equal(observedSelf.hand[0].instanceId, observerCard.instanceId);
+    assert.equal(observedOpponent.hand, null);
+    assert.equal(observedOpponent.handCount, 1);
+    assert.equal(observedOpponent.deckCount, 1);
+    assert.equal(observedOpponent.discardPile[0].instanceId, opponentDiscard.instanceId);
+    assert.equal(JSON.stringify(observation).includes(opponentCard.instanceId), false);
+    assert.equal(JSON.stringify(observation).includes(opponentDeckCard.instanceId), false);
+    assert.deepEqual(
+        observation.recentBattleLog,
+        Array.from({ length: 10 }, (_, index) => `entry-${index}`)
+    );
+    assert.equal(observation.battleLog, undefined);
+});
+
+test('getPlayerObservation returns an immutable snapshot with private pending choices', () => {
+    const room = createRoom();
+    room.baseDiscardPile.push({ id: 'discarded-base', name: 'Discarded Base' });
+    room.pendingAbility = {
+        type: 'boardEffect',
+        playerId: 'bot-1',
+        sourceCardName: 'Test Card',
+        candidateIds: ['target-1'],
+        continuation: { hiddenServerControl: true }
+    };
+
+    const botObservation = getPlayerObservation(room, 'bot-1');
+    const opponentObservation = getPlayerObservation(room, 'human-1');
+
+    assert.deepEqual(botObservation.pendingDecision.candidateIds, ['target-1']);
+    assert.equal(botObservation.pendingDecision.continuation, undefined);
+    assert.equal(opponentObservation.pendingDecision.candidateIds, undefined);
+    assert.equal(opponentObservation.pendingDecision.controlledByObserver, false);
+
+    botObservation.players[0].name = 'Changed';
+    botObservation.activeBases[0].name = 'Changed Base';
+    botObservation.baseDiscardPile[0].name = 'Changed Discarded Base';
+    botObservation.pendingDecision.candidateIds.push('target-2');
+
+    assert.equal(room.players[0].name, 'Bot One');
+    assert.equal(room.activeBases[0].name, 'Test Base');
+    assert.equal(room.baseDiscardPile[0].name, 'Discarded Base');
+    assert.deepEqual(room.pendingAbility.candidateIds, ['target-1']);
+    assert.equal(getPlayerObservation(room, 'missing-player'), null);
+});
+
+test('decision metadata groups follow-up choices into one resolution', () => {
+    const room = createRoom();
+    const laseratops = createCard('dino_bro_1', 'bot-1', 'metadata-laseratops');
+    const target = createCard('robot_zapbot_1', 'human-1', 'metadata-target');
+    room.players[0].hand.push(laseratops);
+    room.activeBases[0].playedCards.push(target);
+
+    const playObservation = getPlayerObservation(room, 'bot-1');
+    const playResult = executeGameAction({
+        room,
+        roomId: 'ROOM1',
+        actorId: 'bot-1',
+        action: {
+            type: 'play-card',
+            cardInstanceId: laseratops.instanceId,
+            baseIndex: 0
+        }
+    });
+    const targetObservation = getPlayerObservation(room, 'bot-1');
+
+    assert.equal(playResult.ok, true);
+    assert.equal(playObservation.resolutionId, 'resolution-1');
+    assert.equal(playObservation.decisionType, 'turnAction');
+    assert.equal(playObservation.stepIndex, 0);
+    assert.equal(targetObservation.resolutionId, playObservation.resolutionId);
+    assert.equal(targetObservation.decisionType, 'boardEffect');
+    assert.equal(targetObservation.stepIndex, 1);
+
+    const targetAction = getLegalActions(room, 'bot-1').find(action => (
+        action.choice.minionInstanceId === target.instanceId
+    ));
+    executeGameAction({
+        room,
+        roomId: 'ROOM1',
+        actorId: 'bot-1',
+        action: targetAction
+    });
+    const nextActionObservation = getPlayerObservation(room, 'bot-1');
+
+    assert.equal(nextActionObservation.resolutionId, 'resolution-2');
+    assert.equal(nextActionObservation.decisionType, 'turnAction');
+    assert.equal(nextActionObservation.stepIndex, 0);
+});
+
+test('the trajectory links consecutive player decisions and records VP rewards', () => {
+    const room = createRoom();
+    room.gameStartedAt = '2026-08-27T12:00:00.000Z';
+    room.botPolicyVersion = 'random-v1';
+    room.players[0].factions = ['Dinosaurs', 'Pirates'];
+    const firstObservation = getPlayerObservation(room, 'bot-1');
+    const firstLegalActions = [{ type: 'end-turn' }];
+
+    recordTrajectoryDecision({
+        room,
+        roomId: 'ROOM1',
+        playerId: 'bot-1',
+        observation: firstObservation,
+        legalActions: firstLegalActions,
+        chosenAction: firstLegalActions[0]
+    });
+
+    room.players[0].vp = 3;
+    room.currentTurnPlayerId = 'bot-1';
+    const secondObservation = getPlayerObservation(room, 'bot-1');
+    recordTrajectoryDecision({
+        room,
+        roomId: 'ROOM1',
+        playerId: 'bot-1',
+        observation: secondObservation,
+        legalActions: firstLegalActions,
+        chosenAction: firstLegalActions[0]
+    });
+
+    const activeTrajectory = getRoomTrajectory(room);
+    assert.equal(activeTrajectory.schemaVersion, 3);
+    assert.equal(activeTrajectory.gameId, 'ROOM1');
+    assert.equal(activeTrajectory.metadata.trajectorySchemaVersion, 3);
+    assert.equal(activeTrajectory.metadata.observationSchemaVersion, 3);
+    assert.equal(activeTrajectory.metadata.policyVersion, 'random-v1');
+    assert.equal(activeTrajectory.metadata.randomSeed, 123456);
+    assert.equal(activeTrajectory.metadata.randomAlgorithm, 'mulberry32-v1');
+    assert.equal(activeTrajectory.metadata.startedAt, room.gameStartedAt);
+    assert.equal(activeTrajectory.metadata.completedAt, null);
+    assert.equal(activeTrajectory.metadata.decisionCount, 2);
+    assert.deepEqual(activeTrajectory.metadata.players[0].factions, ['Dinosaurs', 'Pirates']);
+    assert.equal(activeTrajectory.entries.length, 2);
+    assert.equal(activeTrajectory.entries[0].resolutionId, firstObservation.resolutionId);
+    assert.equal(activeTrajectory.entries[0].decisionType, 'turnAction');
+    assert.equal(activeTrajectory.entries[0].stepIndex, 0);
+    assert.equal(activeTrajectory.entries[0].chosenActionIndex, 0);
+    assert.equal(activeTrajectory.entries[0].reward, 3);
+    assert.equal(activeTrajectory.entries[0].nextObservation.players[0].vp, 3);
+    assert.equal(activeTrajectory.entries[0].done, false);
+    assert.equal(activeTrajectory.entries[1].reward, null);
+
+    const completedTrajectory = finalizeRoomTrajectory(room, { terminated: true });
+    assert.equal(completedTrajectory.entries[1].reward, 0);
+    assert.equal(completedTrajectory.entries[1].terminated, true);
+    assert.equal(completedTrajectory.entries[1].done, true);
+    assert.equal(completedTrajectory.metadata.terminated, true);
+    assert.equal(completedTrajectory.metadata.truncated, false);
+    assert.equal(completedTrajectory.metadata.terminationReason, 'terminated');
+    assert.match(completedTrajectory.metadata.completedAt, /^\d{4}-\d{2}-\d{2}T/);
+
+    const exportedJson = exportRoomTrajectoryJson(room, { pretty: true });
+    const exportedTrajectory = JSON.parse(exportedJson);
+    assert.equal(exportedTrajectory.metadata.gameId, 'ROOM1');
+    assert.equal(exportedTrajectory.metadata.decisionCount, 2);
+    assert.equal(exportedTrajectory.entries[0].chosenAction.type, 'end-turn');
+    assert.equal(exportedTrajectory.pendingEntryIndexByPlayer, undefined);
+    assert.equal(exportedTrajectory.nextDecisionIndex, undefined);
+    assert.equal(exportedTrajectory.randomState, undefined);
+    assert.equal(exportedTrajectory.metadata.randomState, undefined);
+    assert.match(exportedJson, /\n  "metadata"/);
+
+    completedTrajectory.entries[0].chosenAction.type = 'changed';
+    assert.equal(getRoomTrajectory(room).entries[0].chosenAction.type, 'end-turn');
+});
+
+test('the default bot policy chooses randomly from every legal action', () => {
     const legalActions = [
         { type: 'draft-faction', factionName: 'Aliens' },
         { type: 'draft-faction', factionName: 'Dinosaurs' },
         { type: 'draft-faction', factionName: 'Pirates' }
     ];
 
-    const action = chooseDefaultBotAction({
+    const draftAction = chooseDefaultBotAction({
         legalActions,
         room: { gamePhase: 'drafting' },
         random: () => 0.8
     });
+    const playingAction = chooseDefaultBotAction({
+        legalActions,
+        room: { gamePhase: 'playing' },
+        random: () => 0.4
+    });
 
-    assert.deepEqual(action, legalActions[2]);
+    assert.deepEqual(draftAction, legalActions[2]);
+    assert.deepEqual(playingAction, legalActions[1]);
+    assert.equal(chooseDefaultBotAction({ legalActions: [] }), null);
+    assert.equal(chooseDefaultBotActionIndex({ legalActions, random: () => 0.8 }), 2);
+    assert.equal(chooseDefaultBotActionIndex({ legalActions: [] }), null);
+});
+
+test('default bot decisions are reproducible from the room seed', () => {
+    const legalActions = [
+        { type: 'end-turn' },
+        { type: 'use-talent', cardInstanceId: 'talent-1' },
+        { type: 'play-card', cardInstanceId: 'card-1', baseIndex: 0 }
+    ];
+    const firstRoom = {};
+    const secondRoom = {};
+    initializeSeededRandom(firstRoom, 'bot-policy-replay');
+    initializeSeededRandom(secondRoom, 'bot-policy-replay');
+    const chooseSequence = room => Array.from({ length: 12 }, () => (
+        chooseDefaultBotAction({
+            legalActions,
+            random: () => nextSeededRandom(room)
+        })
+    ));
+
+    assert.deepEqual(chooseSequence(firstRoom), chooseSequence(secondRoom));
+    assert.equal(firstRoom.randomState, secondRoom.randomState);
 });
 
 test('getBotDecisionActorId prioritizes bot-owned pending abilities over turn ownership', () => {
@@ -742,6 +1455,11 @@ test('the bot controller notices and completes a normal bot turn', async () => {
     assert.equal(room.currentTurnPlayerId, 'human-1');
     assert.equal(room.battleLog[0], "**Human One**'s turn");
     assert.equal(scheduledCallbacks.length, 0);
+    const trajectory = getRoomTrajectory(room);
+    assert.equal(trajectory.entries.length, 1);
+    assert.equal(trajectory.entries[0].playerId, 'bot-1');
+    assert.deepEqual(trajectory.entries[0].chosenAction, { type: 'end-turn' });
+    assert.equal(trajectory.entries[0].observation.isObserverTurn, true);
 });
 
 test('the bot controller resolves a bot trigger during another player turn', async () => {
@@ -762,6 +1480,10 @@ test('the bot controller resolves a bot trigger during another player turn', asy
 
     assert.equal(room.pendingAbility, null);
     assert.equal(room.currentTurnPlayerId, 'human-1');
-    assert.equal(room.players[0].hand[0].instanceId, drawnCard.instanceId);
+    assert.equal(
+        [...room.players[0].hand, ...room.players[0].deck]
+            .some(card => card.instanceId === drawnCard.instanceId),
+        true
+    );
     assert.equal(scheduledCallbacks.length, 0);
 });

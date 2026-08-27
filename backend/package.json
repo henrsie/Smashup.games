@@ -4,6 +4,8 @@
   "description": "",
   "main": "server.js",
   "scripts": {
+    "env-server": "node headlessEnvironmentServer.js",
+    "simulate": "node headlessSimulation.js",
     "test": "node --test",
     "start": "node server.js"
   },

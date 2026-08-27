@@ -1,5 +1,7 @@
 // backend/bases.js
 
+const { systemRandom } = require('./random.js');
+
 const basesData = [
   {
     id: 'base_the_plant',
@@ -86,11 +88,11 @@ const basesData = [
   }
 ];
 
-function buildBaseDeck() {
+function buildBaseDeck(random = systemRandom) {
   // Shuffle base deck template instances
   let deck = [...basesData];
   for (let i = deck.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
+    const j = Math.floor(random() * (i + 1));
     [deck[i], deck[j]] = [deck[j], deck[i]];
   }
   return deck;
