@@ -7,6 +7,13 @@ const { factionsData, buildFactionDeck } = require('./factions.js');
 const { getTriggeredEffects } = require('./abilityQueue.js');
 const { createBotMatchJobManager } = require('./botMatchRunner.js');
 const {
+    ENTITY_ID_SCHEMA_VERSION,
+    UNKNOWN_ENTITY_ID,
+    getBaseEntityId,
+    getCardEntityId,
+    getFactionEntityId
+} = require('./gameEntityIds.js');
+const {
     BOT_POLICY_VERSIONS,
     chooseGreedyHeuristic1ActionIndex,
     chooseGreedyHeuristic2ActionIndex,
@@ -37,8 +44,8 @@ const MAX_CHAT_MESSAGE_LENGTH = 500;
 const BOT_ACTION_DELAY_MS = 600;
 const MAX_CONSECUTIVE_BOT_ACTIONS = 100;
 const DISCONNECT_GRACE_PERIOD_MS = 10_000;
-const TRAJECTORY_SCHEMA_VERSION = 3;
-const OBSERVATION_SCHEMA_VERSION = 3;
+const TRAJECTORY_SCHEMA_VERSION = 4;
+const OBSERVATION_SCHEMA_VERSION = 4;
 const DEFAULT_BOT_POLICY_VERSION = BOT_POLICY_VERSIONS.RANDOM;
 const WINNING_VICTORY_POINTS = 15;
 const WIN_REWARD = 1;
@@ -1574,6 +1581,7 @@ function getPlayerObservation(room, playerId) {
     const decisionMetadata = getOrCreateDecisionMetadata(room, playerId);
     return {
         schemaVersion: OBSERVATION_SCHEMA_VERSION,
+        entityIdSchemaVersion: ENTITY_ID_SCHEMA_VERSION,
         observerPlayerId: playerId,
         resolutionId: decisionMetadata?.resolutionId || null,
         decisionType: decisionMetadata?.decisionType || null,
@@ -1589,6 +1597,7 @@ function getPlayerObservation(room, playerId) {
             online: player.online !== false,
             vp: Number.isFinite(player.vp) ? player.vp : 0,
             factions: cloneObservationValue(player.factions || []),
+            factionEntityIds: (player.factions || []).map(getFactionEntityId),
             hand: player.id === playerId ? cloneObservationValue(player.hand || []) : null,
             handCount: player.hand?.length || 0,
             deckCount: player.deck?.length || 0,
@@ -1617,6 +1626,7 @@ function ensureRoomTrajectory(room, roomId) {
             metadata: {
                 trajectorySchemaVersion: TRAJECTORY_SCHEMA_VERSION,
                 observationSchemaVersion: OBSERVATION_SCHEMA_VERSION,
+                entityIdSchemaVersion: ENTITY_ID_SCHEMA_VERSION,
                 gameId: roomId,
                 policyVersion: room.botPolicyVersion || DEFAULT_BOT_POLICY_VERSION,
                 randomSeed: room.randomSeed ?? null,
@@ -1652,6 +1662,11 @@ function syncTrajectoryMetadata(room, trajectory) {
             || room.draftState?.picks?.[player.id]
             || []
         ),
+        factionEntityIds: (
+            player.factions
+            || room.draftState?.picks?.[player.id]
+            || []
+        ).map(getFactionEntityId),
         finalVictoryPoints: Number.isFinite(player.vp) ? player.vp : 0
     }));
     trajectory.metadata.decisionCount = trajectory.entries.length;
@@ -1823,7 +1838,8 @@ function buildFinalStandings(room) {
             name: player.name,
             vp: victoryPoints,
             isBot: player.isBot === true,
-            factions: cloneObservationValue(player.factions || [])
+            factions: cloneObservationValue(player.factions || []),
+            factionEntityIds: (player.factions || []).map(getFactionEntityId)
         };
     });
 }
@@ -1873,19 +1889,63 @@ function finishGameIfNeeded(
     return gameResult;
 }
 
+function getActionCardEntityId(room, instanceId) {
+    if (!instanceId) return UNKNOWN_ENTITY_ID;
+    return getCardEntityId(findCardByInstanceId(room, instanceId));
+}
+
+function annotateLegalActionEntityIds(room, action) {
+    const choice = action.choice || {};
+    const baseIndex = Number.isInteger(action.baseIndex)
+        ? action.baseIndex
+        : Number.isInteger(choice.baseIndex)
+            ? choice.baseIndex
+            : null;
+    const base = choice.baseInstanceId
+        || (baseIndex === null ? null : room.activeBases?.[baseIndex]);
+    const selectedInstanceIds = [
+        ...(Array.isArray(choice.cardInstanceIds) ? choice.cardInstanceIds : []),
+        ...(Array.isArray(choice.minionInstanceIds) ? choice.minionInstanceIds : [])
+    ];
+
+    return {
+        ...action,
+        entityIds: {
+            cardEntityId: getActionCardEntityId(
+                room,
+                action.cardInstanceId || choice.cardInstanceId
+            ),
+            targetCardEntityId: getActionCardEntityId(
+                room,
+                action.targetMinionInstanceId || choice.minionInstanceId
+            ),
+            baseEntityId: getBaseEntityId(base),
+            factionEntityId: getFactionEntityId(action.factionName || choice.faction),
+            selectedCardEntityIds: selectedInstanceIds.map(instanceId => (
+                getActionCardEntityId(room, instanceId)
+            ))
+        }
+    };
+}
+
+function annotateLegalActionEntityIdsList(room, legalActions) {
+    return legalActions.map(action => annotateLegalActionEntityIds(room, action));
+}
+
 function getLegalActions(room, actorId) {
     const player = room?.players?.find(candidate => candidate.id === actorId);
     if (!room || !player) return [];
 
     if (room.pendingAbility) {
         if (room.pendingAbility.playerId !== actorId) return [];
-        return getLegalAbilityChoiceActions(room, actorId);
+        return annotateLegalActionEntityIdsList(room, getLegalAbilityChoiceActions(room, actorId));
     }
 
     if (room.gamePhase === 'drafting') {
-        return (room.draftState?.availableFactions || [])
+        const legalActions = (room.draftState?.availableFactions || [])
             .map(factionName => ({ type: 'draft-faction', factionName }))
             .filter(action => validateDraftFactionAction(room, actorId, action).ok);
+        return annotateLegalActionEntityIdsList(room, legalActions);
     }
 
     if (room.gamePhase !== 'playing') return [];
@@ -1910,7 +1970,7 @@ function getLegalActions(room, actorId) {
     }
 
     if (validateEndTurnAction(room, actorId).ok) legalActions.push({ type: 'end-turn' });
-    return legalActions;
+    return annotateLegalActionEntityIdsList(room, legalActions);
 }
 
 function getLegalCardPlayActions(room, actorId, cards, fromDiscard) {
@@ -5583,8 +5643,13 @@ function generateDraftOrder(players) {
 function sanitizeDraftState(draft) {
     return {
         availableFactions: draft.availableFactions,
+        availableFactionEntityIds: draft.availableFactions.map(getFactionEntityId),
         currentPickerId: draft.draftOrder[draft.currentTurnIndex],
-        picks: draft.picks
+        picks: draft.picks,
+        pickFactionEntityIds: Object.fromEntries(Object.entries(draft.picks).map(([playerId, factions]) => [
+            playerId,
+            factions.map(getFactionEntityId)
+        ]))
     };
 }
 

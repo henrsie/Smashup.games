@@ -1,6 +1,7 @@
 // backend/factions.js
 
 const { systemRandom } = require('./random.js');
+const { getCardEntityId, getFactionEntityId } = require('./gameEntityIds.js');
 
 const factionsData = {
   Dinosaurs: {
@@ -250,7 +251,9 @@ const abilityDefinitions = {
 };
 
 for (const faction of Object.values(factionsData)) {
+  faction.factionEntityId = getFactionEntityId(faction.name);
   for (const card of faction.cards) {
+    card.cardEntityId = getCardEntityId(card.id);
     card.abilities = abilityDefinitions[card.id] ?? [];
   }
 }
@@ -265,6 +268,7 @@ function buildFactionDeck(factionKey, random = systemRandom) {
       deck.push({
         instanceId: `${cardTemplate.id}_${random().toString(36).slice(2, 7)}`,
         cardId: cardTemplate.id,
+        cardEntityId: cardTemplate.cardEntityId,
         name: cardTemplate.name,
         type: cardTemplate.type,
         subtype: cardTemplate.subtype,
@@ -273,6 +277,7 @@ function buildFactionDeck(factionKey, random = systemRandom) {
         ability: cardTemplate.ability,
         abilities: cardTemplate.abilities,
         faction: faction.name,
+        factionEntityId: faction.factionEntityId,
         discard: cardTemplate.discard
       });
     }

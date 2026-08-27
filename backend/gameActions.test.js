@@ -1156,8 +1156,28 @@ test('getLegalActions returns all available factions only for the current drafte
     };
 
     assert.deepEqual(getLegalActions(room, 'bot-1'), [
-        { type: 'draft-faction', factionName: 'Aliens' },
-        { type: 'draft-faction', factionName: 'Dinosaurs' }
+        {
+            type: 'draft-faction',
+            factionName: 'Aliens',
+            entityIds: {
+                cardEntityId: 0,
+                targetCardEntityId: 0,
+                baseEntityId: 0,
+                factionEntityId: 2,
+                selectedCardEntityIds: []
+            }
+        },
+        {
+            type: 'draft-faction',
+            factionName: 'Dinosaurs',
+            entityIds: {
+                cardEntityId: 0,
+                targetCardEntityId: 0,
+                baseEntityId: 0,
+                factionEntityId: 1,
+                selectedCardEntityIds: []
+            }
+        }
     ]);
     assert.equal(getLegalActions(room, 'human-1').length, 0);
 });
@@ -1302,10 +1322,11 @@ test('the trajectory links consecutive player decisions and records VP rewards',
     });
 
     const activeTrajectory = getRoomTrajectory(room);
-    assert.equal(activeTrajectory.schemaVersion, 3);
+    assert.equal(activeTrajectory.schemaVersion, 4);
     assert.equal(activeTrajectory.gameId, 'ROOM1');
-    assert.equal(activeTrajectory.metadata.trajectorySchemaVersion, 3);
-    assert.equal(activeTrajectory.metadata.observationSchemaVersion, 3);
+    assert.equal(activeTrajectory.metadata.trajectorySchemaVersion, 4);
+    assert.equal(activeTrajectory.metadata.observationSchemaVersion, 4);
+    assert.equal(activeTrajectory.metadata.entityIdSchemaVersion, 1);
     assert.equal(activeTrajectory.metadata.policyVersion, 'random-v1');
     assert.equal(activeTrajectory.metadata.randomSeed, 123456);
     assert.equal(activeTrajectory.metadata.randomAlgorithm, 'mulberry32-v1');
@@ -1458,7 +1479,16 @@ test('the bot controller notices and completes a normal bot turn', async () => {
     const trajectory = getRoomTrajectory(room);
     assert.equal(trajectory.entries.length, 1);
     assert.equal(trajectory.entries[0].playerId, 'bot-1');
-    assert.deepEqual(trajectory.entries[0].chosenAction, { type: 'end-turn' });
+    assert.deepEqual(trajectory.entries[0].chosenAction, {
+        type: 'end-turn',
+        entityIds: {
+            cardEntityId: 0,
+            targetCardEntityId: 0,
+            baseEntityId: 0,
+            factionEntityId: 0,
+            selectedCardEntityIds: []
+        }
+    });
     assert.equal(trajectory.entries[0].observation.isObserverTurn, true);
 });
 

@@ -1,6 +1,7 @@
 // backend/bases.js
 
 const { systemRandom } = require('./random.js');
+const { getBaseEntityId } = require('./gameEntityIds.js');
 
 const basesData = [
   {
@@ -87,6 +88,10 @@ const basesData = [
     ]
   }
 ];
+
+basesData.forEach(base => {
+  base.baseEntityId = getBaseEntityId(base.id);
+});
 
 function buildBaseDeck(random = systemRandom) {
   // Shuffle base deck template instances

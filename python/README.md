@@ -21,4 +21,6 @@ python3 python/smoke_test.py --seed 380
 - `result()`: returns the episode summary.
 - `close()`: deletes the environment from Node memory.
 
+Stable card, faction, and base integer IDs are stored in `../shared/gameEntityIds.json` so both Node and Python load the same committed mapping. ID `0` is reserved for unknown or non-applicable entities. Add new entities with new IDs; do not renumber existing entries. Observations report `entityIdSchemaVersion`, and legal actions include an `entityIds` object ready for the Python action encoder.
+
 The local server binds to `127.0.0.1:3001` by default. Override it with `HEADLESS_ENV_HOST` and `HEADLESS_ENV_PORT`. Do not expose this development API publicly without authentication, rate limiting, and environment lifecycle limits.
