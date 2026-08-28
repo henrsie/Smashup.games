@@ -9,8 +9,12 @@ const { createBotMatchJobManager } = require('./botMatchRunner.js');
 const {
     ENTITY_ID_SCHEMA_VERSION,
     UNKNOWN_ENTITY_ID,
+    getActionTypeId,
     getBaseEntityId,
+    getCardZoneId,
     getCardEntityId,
+    getChoiceTypeId,
+    getEventTypeId,
     getFactionEntityId
 } = require('./gameEntityIds.js');
 const {
@@ -41,11 +45,14 @@ const MAX_PLAYERS = 4;
 const MAX_HAND_SIZE = 10;
 const MAX_CHAT_HISTORY = 100;
 const MAX_CHAT_MESSAGE_LENGTH = 500;
+const MAX_STRUCTURED_EVENT_HISTORY = 100;
+const RECENT_STRUCTURED_EVENT_LIMIT = 32;
+const STRUCTURED_EVENT_SCHEMA_VERSION = 1;
 const BOT_ACTION_DELAY_MS = 600;
 const MAX_CONSECUTIVE_BOT_ACTIONS = 100;
 const DISCONNECT_GRACE_PERIOD_MS = 10_000;
-const TRAJECTORY_SCHEMA_VERSION = 4;
-const OBSERVATION_SCHEMA_VERSION = 4;
+const TRAJECTORY_SCHEMA_VERSION = 5;
+const OBSERVATION_SCHEMA_VERSION = 5;
 const DEFAULT_BOT_POLICY_VERSION = BOT_POLICY_VERSIONS.RANDOM;
 const WINNING_VICTORY_POINTS = 15;
 const WIN_REWARD = 1;
@@ -290,6 +297,8 @@ io.on('connection', (socket) => {
             baseDiscardPile: [],
             pendingAbility: null,
             temporaryEffects: [],
+            structuredEvents: [],
+            nextStructuredEventNumber: 0,
             chatMessages: []
         };
         initializeSeededRandom(room, randomSeed ?? generateRandomSeed());
@@ -850,6 +859,13 @@ function executePlayCardAction({ room, roomId, actorId, action, actorTransport }
         playerName: player.name,
         targetName,
         targetCard: targetMinion
+    }, {
+        eventType: 'card-played',
+        actorPlayerId: player.id,
+        card: playedCard,
+        targetCard: targetMinion,
+        base: targetBase,
+        count: 1
     });
 
     recalculateOngoingEffects(room);
@@ -1153,7 +1169,10 @@ function finishFactionDraft(room, draft) {
     room.turnState = createInitialTurnState();
     room.pendingAbility = null;
     room.temporaryEffects = [];
-    addBattleLog(room, `**${firstPlayer.name}**'s turn`);
+    addBattleLog(room, `**${firstPlayer.name}**'s turn`, {
+        eventType: 'turn-started',
+        actorPlayerId: firstPlayer.id
+    });
 }
 
 function executeDraftFactionAction({ room, actorId, action }) {
@@ -1265,13 +1284,25 @@ function ensurePlayerDeckCards(room, player, requiredCount = 1) {
     player.discardPile = player.discardPile.filter(card => !recyclableIds.has(card.instanceId));
     shuffleDeck(recyclableCards, () => nextSeededRandom(room));
     player.deck.push(...recyclableCards);
-    addBattleLog(room, `**${player.name}** shuffles their discard pile to form a new deck.`);
+    addBattleLog(room, `**${player.name}** shuffles their discard pile to form a new deck.`, {
+        eventType: 'deck-shuffled',
+        actorPlayerId: player.id,
+        count: recyclableCards.length
+    });
     return true;
 }
 
 function drawPlayerCard(room, player) {
     ensurePlayerDeckCards(room, player, 1);
-    return player?.deck.shift() || null;
+    const card = player?.deck.shift() || null;
+    if (card) {
+        recordStructuredEvent(room, {
+            eventType: 'card-drawn',
+            actorPlayerId: player.id,
+            count: 1
+        });
+    }
+    return card;
 }
 
 function drawEndTurnCards(room, player) {
@@ -1307,7 +1338,12 @@ function resolveBotHandLimitDiscard(room, actor, choice) {
 
     const [discardedCard] = player.hand.splice(cardIndex, 1);
     player.discardPile.push(discardedCard);
-    addBattleLog(room, `**${player.name}** discards **${discardedCard.name}** to meet the hand limit.`);
+    addBattleLog(room, `**${player.name}** discards **${discardedCard.name}** to meet the hand limit.`, {
+        eventType: 'card-discarded',
+        actorPlayerId: player.id,
+        card: discardedCard,
+        count: 1
+    });
 
     if (player.hand.length > MAX_HAND_SIZE) {
         pendingAbility.candidateIds = player.hand.map(card => card.instanceId);
@@ -1328,7 +1364,10 @@ function advanceToNextTurn(room, actorId) {
     room.currentTurnPlayerId = nextPlayer.id;
     room.turnState = createInitialTurnState();
     room.gamePhase = 'playing';
-    addBattleLog(room, `**${nextPlayer.name}**'s turn`);
+    addBattleLog(room, `**${nextPlayer.name}**'s turn`, {
+        eventType: 'turn-started',
+        actorPlayerId: nextPlayer.id
+    });
     resolveStartTurnActions(room, nextPlayer.id);
     return nextPlayer;
 }
@@ -1360,7 +1399,12 @@ function executeEndTurnAction({
             .map(baseIndex => room.activeBases[baseIndex]?.id)
             .filter(Boolean);
         scoringBases.forEach(baseIndex => {
-            addBattleLog(room, `**${room.activeBases[baseIndex].name}** is scoring!`);
+            const scoringBase = room.activeBases[baseIndex];
+            addBattleLog(room, `**${scoringBase.name}** is scoring!`, {
+                eventType: 'base-scoring-started',
+                actorPlayerId: player.id,
+                base: scoringBase
+            });
         });
         addBattleLog(room, `**${player.name}** has ended their turn`);
         room.gamePhase = 'scoring';
@@ -1457,6 +1501,15 @@ function executeGameAction({
         return failGameAction('invalid_action', 'A game action type is required.');
     }
     const decisionMetadata = getOrCreateDecisionMetadata(room, actorId);
+    const structuredActionEvent = createStructuredActionEvent(
+        room,
+        actorId,
+        action,
+        decisionMetadata
+    );
+    const recordedActionEvent = structuredActionEvent
+        ? recordStructuredEvent(room, structuredActionEvent)
+        : null;
 
     let result;
     if (action.type === 'play-card') {
@@ -1486,6 +1539,8 @@ function executeGameAction({
             if (emitRoomEvent) emitRoomEvent(roomId, event, payload);
         });
         if (!result.suppressDefaultStateEmission && emitState) emitState(roomId, room);
+    } else if (recordedActionEvent) {
+        removeStructuredEvent(room, recordedActionEvent.sequenceNumber);
     }
     return result;
 }
@@ -1613,6 +1668,8 @@ function getPlayerObservation(room, playerId) {
         draftState: room.draftState
             ? cloneObservationValue(sanitizeDraftState(room.draftState))
             : null,
+        eventSchemaVersion: STRUCTURED_EVENT_SCHEMA_VERSION,
+        recentEvents: getRecentStructuredEvents(room, playerId),
         recentBattleLog: cloneObservationValue((room.battleLog || []).slice(0, 10))
     };
 }
@@ -1627,6 +1684,8 @@ function ensureRoomTrajectory(room, roomId) {
                 trajectorySchemaVersion: TRAJECTORY_SCHEMA_VERSION,
                 observationSchemaVersion: OBSERVATION_SCHEMA_VERSION,
                 entityIdSchemaVersion: ENTITY_ID_SCHEMA_VERSION,
+                eventSchemaVersion: STRUCTURED_EVENT_SCHEMA_VERSION,
+                eventHistorySource: 'native-v1',
                 gameId: roomId,
                 policyVersion: room.botPolicyVersion || DEFAULT_BOT_POLICY_VERSION,
                 randomSeed: room.randomSeed ?? null,
@@ -1877,7 +1936,12 @@ function finishGameIfNeeded(
     ]));
     addBattleLog(
         room,
-        `**${gameResult.winnerName}** wins the game with **${gameResult.winningVictoryPoints} victory points**!`
+        `**${gameResult.winnerName}** wins the game with **${gameResult.winningVictoryPoints} victory points**!`,
+        {
+            eventType: 'game-finished',
+            actorPlayerId: gameResult.winnerId,
+            amount: gameResult.winningVictoryPoints
+        }
     );
     finalizeRoomTrajectory(room, {
         terminated: true,
@@ -1894,6 +1958,156 @@ function getActionCardEntityId(room, instanceId) {
     return getCardEntityId(findCardByInstanceId(room, instanceId));
 }
 
+function getPendingAbilityCards(room) {
+    const cards = [];
+    const foundInstanceIds = new Set();
+    const visited = new Set();
+    const visit = value => {
+        if (!value || typeof value !== 'object' || visited.has(value)) return;
+        visited.add(value);
+        if (typeof value.instanceId === 'string' && !foundInstanceIds.has(value.instanceId)) {
+            foundInstanceIds.add(value.instanceId);
+            cards.push(value);
+        }
+        if (Array.isArray(value)) {
+            value.forEach(visit);
+            return;
+        }
+        Object.entries(value)
+            .filter(([key, nestedValue]) => key !== 'continuation' && typeof nestedValue !== 'function')
+            .forEach(([, nestedValue]) => visit(nestedValue));
+    };
+    visit(room.pendingAbility);
+    return cards;
+}
+
+function getLegalActionChoiceType(action) {
+    const choice = action.choice || {};
+    if (choice.cancel === true) return 'cancel';
+    if (choice.finishSelection === true) return 'finish-selection';
+    if (choice.skip === true || choice.choiceId === 'skip') return 'skip';
+    if (choice.choiceId === 'accept') return 'accept';
+    if (choice.choiceId === 'discard') return 'discard';
+    if (choice.choiceId === 'return') return 'return';
+    if (choice.choiceId === 'hand') return 'hand';
+    if (choice.choiceId === 'playExtra') return 'play-extra';
+    if (choice.minionInstanceId || action.targetMinionInstanceId) return 'minion';
+    if (choice.cardInstanceId) return 'card';
+    if (Number.isInteger(choice.baseIndex) || choice.baseInstanceId) return 'base';
+    if (choice.playerId) return 'player';
+    if (choice.faction) return 'faction';
+    if (Number.isFinite(choice.amount)) return 'amount';
+    return 'none';
+}
+
+function getCardActionLocation(room, instanceId) {
+    const emptyLocation = {
+        zoneId: UNKNOWN_ENTITY_ID,
+        ownerSeat: 0,
+        basePosition: 0,
+        cardPosition: 0,
+        parentCardPosition: 0
+    };
+    if (!instanceId) return emptyLocation;
+
+    for (let playerIndex = 0; playerIndex < (room.players || []).length; playerIndex += 1) {
+        const player = room.players[playerIndex];
+        const zones = [
+            ['hand', player.hand],
+            ['deck', player.deck],
+            ['discard', player.discardPile]
+        ];
+        for (const [zone, cards] of zones) {
+            const cardIndex = (cards || []).findIndex(card => card.instanceId === instanceId);
+            if (cardIndex >= 0) {
+                return {
+                    zoneId: getCardZoneId(zone),
+                    ownerSeat: playerIndex + 1,
+                    basePosition: 0,
+                    cardPosition: cardIndex + 1,
+                    parentCardPosition: 0
+                };
+            }
+        }
+    }
+
+    for (let baseIndex = 0; baseIndex < (room.activeBases || []).length; baseIndex += 1) {
+        const playedCards = room.activeBases[baseIndex].playedCards || [];
+        for (let cardIndex = 0; cardIndex < playedCards.length; cardIndex += 1) {
+            const card = playedCards[cardIndex];
+            const ownerIndex = (room.players || []).findIndex(player => player.id === card.ownerId);
+            if (card.instanceId === instanceId) {
+                return {
+                    zoneId: getCardZoneId('board'),
+                    ownerSeat: ownerIndex + 1,
+                    basePosition: baseIndex + 1,
+                    cardPosition: cardIndex + 1,
+                    parentCardPosition: 0
+                };
+            }
+            const attachedIndex = (card.attachedCards || [])
+                .findIndex(attachedCard => attachedCard.instanceId === instanceId);
+            if (attachedIndex >= 0) {
+                const attachedCard = card.attachedCards[attachedIndex];
+                const attachedOwnerIndex = (room.players || [])
+                    .findIndex(player => player.id === attachedCard.ownerId);
+                return {
+                    zoneId: getCardZoneId('attached'),
+                    ownerSeat: attachedOwnerIndex + 1,
+                    basePosition: baseIndex + 1,
+                    cardPosition: attachedIndex + 1,
+                    parentCardPosition: cardIndex + 1
+                };
+            }
+        }
+    }
+
+    const heldIndex = (room.scoringHeldMinions || [])
+        .findIndex(card => card.instanceId === instanceId);
+    if (heldIndex >= 0) {
+        const heldCard = room.scoringHeldMinions[heldIndex];
+        const ownerIndex = (room.players || []).findIndex(player => player.id === heldCard.ownerId);
+        return {
+            zoneId: getCardZoneId('scoring-held'),
+            ownerSeat: ownerIndex + 1,
+            basePosition: 0,
+            cardPosition: heldIndex + 1,
+            parentCardPosition: 0
+        };
+    }
+
+
+    const pendingCards = getPendingAbilityCards(room);
+    const pendingIndex = pendingCards.findIndex(card => card.instanceId === instanceId);
+    if (pendingIndex >= 0) {
+        const pendingCard = pendingCards[pendingIndex];
+        const ownerIndex = (room.players || [])
+            .findIndex(player => player.id === pendingCard.ownerId);
+        return {
+            zoneId: getCardZoneId('pending-choice'),
+            ownerSeat: ownerIndex + 1,
+            basePosition: 0,
+            cardPosition: pendingIndex + 1,
+            parentCardPosition: 0
+        };
+    }
+
+    return emptyLocation;
+}
+
+function getLegalActionEncoding(action) {
+    return {
+        actionTypeId: action.actionTypeId || UNKNOWN_ENTITY_ID,
+        choiceTypeId: action.choiceTypeId || UNKNOWN_ENTITY_ID,
+        entityIds: action.entityIds || {},
+        choiceFeatures: action.choiceFeatures || {}
+    };
+}
+
+function getLegalActionEncodingKey(action) {
+    return JSON.stringify(getLegalActionEncoding(action));
+}
+
 function annotateLegalActionEntityIds(room, action) {
     const choice = action.choice || {};
     const baseIndex = Number.isInteger(action.baseIndex)
@@ -1907,29 +2121,67 @@ function annotateLegalActionEntityIds(room, action) {
         ...(Array.isArray(choice.cardInstanceIds) ? choice.cardInstanceIds : []),
         ...(Array.isArray(choice.minionInstanceIds) ? choice.minionInstanceIds : [])
     ];
+    const sourceInstanceId = action.cardInstanceId || choice.cardInstanceId;
+    const targetInstanceId = action.targetMinionInstanceId || choice.minionInstanceId;
+    const sourceLocation = getCardActionLocation(room, sourceInstanceId);
+    const targetLocation = getCardActionLocation(room, targetInstanceId);
+    const selectedPlayerIndex = (room.players || [])
+        .findIndex(player => player.id === choice.playerId);
+    const baseDeckPosition = choice.baseInstanceId
+        ? (room.baseDeck || []).findIndex(baseCard => baseCard.id === choice.baseInstanceId) + 1
+        : 0;
 
     return {
         ...action,
+        actionTypeId: getActionTypeId(action.type),
+        choiceTypeId: getChoiceTypeId(getLegalActionChoiceType(action)),
         entityIds: {
             cardEntityId: getActionCardEntityId(
                 room,
-                action.cardInstanceId || choice.cardInstanceId
+                sourceInstanceId
             ),
             targetCardEntityId: getActionCardEntityId(
                 room,
-                action.targetMinionInstanceId || choice.minionInstanceId
+                targetInstanceId
             ),
             baseEntityId: getBaseEntityId(base),
             factionEntityId: getFactionEntityId(action.factionName || choice.faction),
             selectedCardEntityIds: selectedInstanceIds.map(instanceId => (
                 getActionCardEntityId(room, instanceId)
             ))
+        },
+        choiceFeatures: {
+            sourceZoneId: sourceLocation.zoneId,
+            sourceOwnerSeat: sourceLocation.ownerSeat,
+            sourceBasePosition: sourceLocation.basePosition,
+            sourceCardPosition: sourceLocation.cardPosition,
+            sourceParentCardPosition: sourceLocation.parentCardPosition,
+            targetZoneId: targetLocation.zoneId,
+            targetOwnerSeat: targetLocation.ownerSeat,
+            targetBasePosition: targetLocation.basePosition,
+            targetCardPosition: targetLocation.cardPosition,
+            targetParentCardPosition: targetLocation.parentCardPosition,
+            selectedPlayerSeat: selectedPlayerIndex + 1,
+            chosenBasePosition: baseIndex === null ? 0 : baseIndex + 1,
+            baseDeckPosition,
+            selectionCount: selectedInstanceIds.length,
+            amount: Number.isFinite(choice.amount) ? choice.amount : 0,
+            fromDiscard: action.fromDiscard === true ? 1 : 0,
+            candidateOrdinal: 0
         }
     };
 }
 
 function annotateLegalActionEntityIdsList(room, legalActions) {
-    return legalActions.map(action => annotateLegalActionEntityIds(room, action));
+    const semanticOccurrences = new Map();
+    return legalActions.map(action => {
+        const annotatedAction = annotateLegalActionEntityIds(room, action);
+        const semanticKey = getLegalActionEncodingKey(annotatedAction);
+        const candidateOrdinal = semanticOccurrences.get(semanticKey) || 0;
+        semanticOccurrences.set(semanticKey, candidateOrdinal + 1);
+        annotatedAction.choiceFeatures.candidateOrdinal = candidateOrdinal;
+        return annotatedAction;
+    });
 }
 
 function getLegalActions(room, actorId) {
@@ -2789,7 +3041,13 @@ function resolveHandDiscard(room, socket, choice) {
     const [discardedCard] = selectedPlayer.hand.splice(cardIndex, 1);
     selectedPlayer.discardPile.push(discardedCard);
     room.pendingAbility = null;
-    addBattleLog(room, `**${selectedPlayer.name}** discards **${discardedCard.name}**.`);
+    addBattleLog(room, `**${selectedPlayer.name}** discards **${discardedCard.name}**.`, {
+        eventType: 'card-discarded',
+        actorPlayerId: socket.id,
+        targetPlayerId: selectedPlayer.id,
+        card: discardedCard,
+        count: 1
+    });
     return true;
 }
 
@@ -2832,7 +3090,12 @@ function resolveBaseDeckSwap(room, choice, continuation) {
     room.baseDeck.push({ ...oldBase, playedCards: undefined });
     if (continuation?.context) continuation.context.replacementBaseIndex = pendingAbility.targetBaseIndex;
     room.pendingAbility = null;
-    addBattleLog(room, `**${oldBase.name}** is replaced by **${replacementBase.name}**.`);
+    addBattleLog(room, `**${oldBase.name}** is replaced by **${replacementBase.name}**.`, {
+        eventType: 'base-replaced',
+        actorPlayerId: pendingAbility.playerId,
+        base: oldBase,
+        destinationBase: replacementBase
+    });
     return true;
 }
 
@@ -2942,7 +3205,14 @@ function resolveSeaDogsDestination(room, socket, choice) {
     sourceBase.playedCards = sourceBase.playedCards.filter(card => !pendingAbility.minionIds.includes(card.instanceId));
     destinationBase.playedCards.push(...moved);
     room.pendingAbility = null;
-    addBattleLog(room, `**${moved.length} minion${moved.length === 1 ? '' : 's'}** move from **${sourceBase.name}** to **${destinationBase.name}**.`);
+    addBattleLog(room, `**${moved.length} minion${moved.length === 1 ? '' : 's'}** move from **${sourceBase.name}** to **${destinationBase.name}**.`, {
+        eventType: 'card-moved',
+        actorPlayerId: socket.id,
+        selectedCards: moved,
+        base: sourceBase,
+        destinationBase,
+        count: moved.length
+    });
     return true;
 }
 
@@ -3010,7 +3280,13 @@ function resolveDiscardToHand(room, socket, choice) {
 
     const [card] = player.discardPile.splice(cardIndex, 1);
     player.hand.push(card);
-    addBattleLog(room, `**${player.name}** returns **${card.name}** from their discard pile to their hand.`);
+    addBattleLog(room, `**${player.name}** returns **${card.name}** from their discard pile to their hand.`, {
+        eventType: 'card-returned-to-hand',
+        actorPlayerId: player.id,
+        targetPlayerId: player.id,
+        card,
+        count: 1
+    });
 
     if (pendingAbility.quantityAny) {
         pendingAbility.selectedName ||= card.name;
@@ -3417,7 +3693,13 @@ function playMinionFromDiscard(room, player, card, baseIndex) {
     playedCard.ownerId = player.id;
     playedCard.ownerName = player.name;
     base.playedCards.push(playedCard);
-    addBattleLog(room, `**${player.name}** plays **${playedCard.name}** from their discard pile on **${base.name}**.`);
+    addBattleLog(room, `**${player.name}** plays **${playedCard.name}** from their discard pile on **${base.name}**.`, {
+        eventType: 'card-played',
+        actorPlayerId: player.id,
+        card: playedCard,
+        base,
+        count: 1
+    });
     recalculateOngoingEffects(room);
     queueAfterMinionPlayedBaseAbilities(room, base, playedCard);
     return true;
@@ -3555,7 +3837,14 @@ function moveMinionToOwnersDeck(room, base, minion, position = 'bottom') {
     });
     movedMinion.attachedCards = [];
     movedMinion.power = getPrintedCardPower(movedMinion);
-    addBattleLog(room, `**${movedMinion.name}** is placed on the ${position} of its owner's deck.`);
+    addBattleLog(room, `**${movedMinion.name}** is placed on the ${position} of its owner's deck.`, {
+        eventType: 'card-moved-to-deck',
+        actorPlayerId: room.currentTurnPlayerId,
+        targetPlayerId: movedMinion.ownerId,
+        card: movedMinion,
+        base,
+        count: 1
+    });
 }
 
 function queueSelectedPlayerBoardEffect(room, roomId, socket, effect, base) {
@@ -3702,7 +3991,15 @@ function resolveMoveDestination(room, socket, choice) {
     const minionIndex = sourceBase.playedCards.findIndex(card => card.instanceId === minion.instanceId);
     sourceBase.playedCards.splice(minionIndex, 1);
     destinationBase.playedCards.push(minion);
-    addBattleLog(room, `**${minion.name}** moves from **${sourceBase.name}** to **${destinationBase.name}**.`);
+    addBattleLog(room, `**${minion.name}** moves from **${sourceBase.name}** to **${destinationBase.name}**.`, {
+        eventType: 'card-moved',
+        actorPlayerId: socket.id,
+        targetPlayerId: minion.ownerId,
+        card: minion,
+        base: sourceBase,
+        destinationBase,
+        count: 1
+    });
 
     pendingAbility.movedMinionIds.push(minion.instanceId);
     pendingAbility.remainingMoves -= 1;
@@ -3918,7 +4215,69 @@ function validateTalentActivation(room, playerId, cardInstanceId) {
     ));
     if (!supported) return { ok: false, error: `${minion.name}'s Talent is not supported yet.` };
 
+    const grantsSameBaseExtraMinion = effects.some(effect => (
+        effect.type === 'grantExtraPlay'
+        && effect.cardType === 'minion'
+        && effect.destination === 'sameBase'
+    ));
+    if (grantsSameBaseExtraMinion
+        && !hasLegalSameBaseTalentMinionPlay(room, playerId, minion, base, effects)) {
+        return {
+            ok: false,
+            error: `${minion.name}'s Talent cannot be used because no minion can be played at this base.`
+        };
+    }
+
     return { ok: true, base, effects, minion, talent, useKey };
+}
+
+function hasLegalSameBaseTalentMinionPlay(room, playerId, sourceMinion, base, effects) {
+    const player = room.players.find(candidate => candidate.id === playerId);
+    const baseIndex = room.activeBases.indexOf(base);
+    if (!player || baseIndex < 0) return false;
+
+    const returnsSelf = effects.some(effect => (
+        effect.type === 'returnToHand' && effect.target === 'self'
+    ));
+    const candidateMinions = [
+        ...(player.hand || []),
+        ...(returnsSelf ? [sourceMinion] : [])
+    ].filter(card => card.type === 'minion');
+    if (candidateMinions.length === 0) return false;
+
+    const simulatedRoom = {
+        ...room,
+        activeBases: room.activeBases.map(candidateBase => (
+            candidateBase === base && returnsSelf
+                ? {
+                    ...candidateBase,
+                    playedCards: (candidateBase.playedCards || [])
+                        .filter(card => card.instanceId !== sourceMinion.instanceId)
+                }
+                : candidateBase
+        )),
+        players: room.players.map(candidate => (
+            candidate.id === playerId
+                ? { ...candidate, hand: candidateMinions }
+                : candidate
+        )),
+        turnState: {
+            ...room.turnState,
+            extraMinionPlays: [{
+                allowedBaseIndex: baseIndex,
+                required: true,
+                sourceZone: 'hand',
+                sourceTalentCardInstanceId: sourceMinion.instanceId
+            }, ...(room.turnState.extraMinionPlays || [])]
+        }
+    };
+
+    return candidateMinions.some(card => validatePlayCardAction(simulatedRoom, playerId, {
+        type: 'play-card',
+        cardInstanceId: card.instanceId,
+        baseIndex,
+        fromDiscard: false
+    }).ok);
 }
 
 function activateTalent(room, playerId, cardInstanceId) {
@@ -4296,6 +4655,14 @@ function returnMinionToHand(room, base, minion) {
         returnedMinion.power = getPrintedCardPower(returnedMinion);
         owner.hand.push(returnedMinion);
     }
+    recordStructuredEvent(room, {
+        eventType: 'card-returned-to-hand',
+        actorPlayerId: room.currentTurnPlayerId,
+        targetPlayerId: returnedMinion.ownerId,
+        card: returnedMinion,
+        base,
+        count: 1
+    });
     removeTemporaryPowerEffectsForCard(room, returnedMinion.instanceId);
     recalculateOngoingEffects(room);
 }
@@ -4548,7 +4915,14 @@ function destroyMinion(
     }
 
     const actor = room.players.find(player => player.id === actorId);
-    addBattleLog(room, `**${actor?.name || actorLabel || 'A player'}** destroys **${destroyedMinion.name}**.`);
+    addBattleLog(room, `**${actor?.name || actorLabel || 'A player'}** destroys **${destroyedMinion.name}**.`, {
+        eventType: 'card-destroyed',
+        actorPlayerId: actorId || null,
+        targetPlayerId: destroyedMinion.ownerId,
+        targetCard: destroyedMinion,
+        base,
+        count: 1
+    });
     recalculateOngoingEffects(room);
 
     getTriggeredEffects(destroyedMinion, 'afterDestroyed', 'destroyMinion').forEach(effect => {
@@ -4756,14 +5130,164 @@ function recalculateOngoingEffects(room) {
 }
 
 function findCardByInstanceId(room, instanceId) {
-    const playerCards = room.players.flatMap(player => [...player.hand, ...player.deck, ...player.discardPile]);
-    const boardCards = room.activeBases.flatMap(base => base.playedCards.flatMap(card => [card, ...(card.attachedCards || [])]));
-    return [...playerCards, ...boardCards].find(card => card.instanceId === instanceId);
+    const playerCards = (room.players || []).flatMap(player => [
+        ...(player.hand || []),
+        ...(player.deck || []),
+        ...(player.discardPile || [])
+    ]);
+    const boardCards = (room.activeBases || []).flatMap(base => (
+        (base.playedCards || []).flatMap(card => [card, ...(card.attachedCards || [])])
+    ));
+    return [
+        ...playerCards,
+        ...boardCards,
+        ...(room.scoringHeldMinions || []),
+        ...getPendingAbilityCards(room)
+    ]
+        .find(card => card.instanceId === instanceId);
 }
 
-function addBattleLog(room, message) {
+function resolveStructuredEntityId(explicitId, entity, resolver) {
+    if (Number.isInteger(explicitId) && explicitId >= UNKNOWN_ENTITY_ID) return explicitId;
+    return resolver(entity);
+}
+
+function recordStructuredEvent(room, event) {
+    if (!room || !event || getEventTypeId(event.eventType) === UNKNOWN_ENTITY_ID) return null;
+    if (!Array.isArray(room.structuredEvents)) room.structuredEvents = [];
+    if (!Number.isInteger(room.nextStructuredEventNumber)) room.nextStructuredEventNumber = 0;
+
+    const actorSeatIndex = room.players.findIndex(player => player.id === event.actorPlayerId);
+    const targetSeatIndex = room.players.findIndex(player => player.id === event.targetPlayerId);
+    const decisionMetadata = room.decisionTracker?.current;
+    const recordedEvent = {
+        schemaVersion: STRUCTURED_EVENT_SCHEMA_VERSION,
+        sequenceNumber: room.nextStructuredEventNumber,
+        eventType: event.eventType,
+        eventTypeId: getEventTypeId(event.eventType),
+        actorPlayerId: event.actorPlayerId || null,
+        actorSeatIndex: actorSeatIndex >= 0 ? actorSeatIndex : null,
+        targetPlayerId: event.targetPlayerId || null,
+        targetSeatIndex: targetSeatIndex >= 0 ? targetSeatIndex : null,
+        cardEntityId: resolveStructuredEntityId(
+            event.cardEntityId,
+            event.card,
+            getCardEntityId
+        ),
+        targetCardEntityId: resolveStructuredEntityId(
+            event.targetCardEntityId,
+            event.targetCard,
+            getCardEntityId
+        ),
+        selectedCardEntityIds: Array.isArray(event.selectedCardEntityIds)
+            ? event.selectedCardEntityIds.filter(Number.isInteger)
+            : (event.selectedCards || []).map(getCardEntityId),
+        baseEntityId: resolveStructuredEntityId(
+            event.baseEntityId,
+            event.base,
+            getBaseEntityId
+        ),
+        destinationBaseEntityId: resolveStructuredEntityId(
+            event.destinationBaseEntityId,
+            event.destinationBase,
+            getBaseEntityId
+        ),
+        factionEntityId: resolveStructuredEntityId(
+            event.factionEntityId,
+            event.faction,
+            getFactionEntityId
+        ),
+        amount: Number.isFinite(event.amount) ? event.amount : 0,
+        count: Number.isFinite(event.count) ? event.count : 0,
+        resolutionId: event.resolutionId || decisionMetadata?.resolutionId || null,
+        stepIndex: Number.isInteger(event.stepIndex)
+            ? event.stepIndex
+            : decisionMetadata?.stepIndex ?? null,
+        privateEntityPlayerId: event.privateEntityPlayerId || null
+    };
+    room.nextStructuredEventNumber += 1;
+    room.structuredEvents.push(recordedEvent);
+    if (room.structuredEvents.length > MAX_STRUCTURED_EVENT_HISTORY) {
+        room.structuredEvents.splice(
+            0,
+            room.structuredEvents.length - MAX_STRUCTURED_EVENT_HISTORY
+        );
+    }
+    return recordedEvent;
+}
+
+function removeStructuredEvent(room, sequenceNumber) {
+    if (!Array.isArray(room?.structuredEvents)) return false;
+    const eventIndex = room.structuredEvents.findIndex(event => (
+        event.sequenceNumber === sequenceNumber
+    ));
+    if (eventIndex < 0) return false;
+    room.structuredEvents.splice(eventIndex, 1);
+    return true;
+}
+
+function sanitizeStructuredEvent(event, observerPlayerId) {
+    const { privateEntityPlayerId, ...visibleEvent } = event;
+    if (!privateEntityPlayerId || privateEntityPlayerId === observerPlayerId) {
+        return cloneObservationValue(visibleEvent);
+    }
+    return {
+        ...cloneObservationValue(visibleEvent),
+        cardEntityId: UNKNOWN_ENTITY_ID,
+        targetCardEntityId: UNKNOWN_ENTITY_ID,
+        selectedCardEntityIds: [],
+        baseEntityId: UNKNOWN_ENTITY_ID,
+        destinationBaseEntityId: UNKNOWN_ENTITY_ID,
+        factionEntityId: UNKNOWN_ENTITY_ID,
+        amount: 0,
+        count: 0
+    };
+}
+
+function getRecentStructuredEvents(room, observerPlayerId) {
+    return (room?.structuredEvents || [])
+        .slice(-RECENT_STRUCTURED_EVENT_LIMIT)
+        .map(event => sanitizeStructuredEvent(event, observerPlayerId));
+}
+
+function createStructuredActionEvent(room, actorId, action, decisionMetadata) {
+    const eventTypesByAction = {
+        'resolve-ability-choice': 'ability-choice-made',
+        'use-talent': 'talent-used',
+        'draft-faction': 'faction-drafted',
+        'end-turn': 'turn-ended'
+    };
+    const eventType = eventTypesByAction[action.type];
+    if (!eventType) return null;
+
+    const annotatedAction = annotateLegalActionEntityIds(room, action);
+    const choice = action.choice || {};
+    return {
+        eventType,
+        actorPlayerId: actorId,
+        targetPlayerId: choice.playerId || action.targetPlayerId || null,
+        ...annotatedAction.entityIds,
+        selectedCardEntityIds: annotatedAction.entityIds.selectedCardEntityIds,
+        amount: Number(choice.amount) || 0,
+        count: annotatedAction.entityIds.selectedCardEntityIds.length,
+        resolutionId: decisionMetadata?.resolutionId || null,
+        stepIndex: decisionMetadata?.stepIndex ?? null,
+        privateEntityPlayerId: action.type === 'resolve-ability-choice' ? actorId : null
+    };
+}
+
+function addBattleLog(room, message, structuredEvent = null) {
     if (!room.battleLog) room.battleLog = [];
     room.battleLog.unshift(message);
+    if (structuredEvent) recordStructuredEvent(room, structuredEvent);
+    if (message?.revealed === true && message.card) {
+        recordStructuredEvent(room, {
+            eventType: 'card-revealed',
+            actorPlayerId: message.card.ownerId || null,
+            card: message.card,
+            count: 1
+        });
+    }
 }
 
 function appendChatMessage(room, sender, rawMessage) {
@@ -4806,7 +5330,14 @@ function resolveStartTurnActions(room, playerId) {
 
             const owner = room.players.find(player => player.id === card.ownerId);
             owner?.discardPile.push(card);
-            addBattleLog(room, `**${card.name}** is destroyed at the start of **${owner?.name || 'its owner'}**'s turn.`);
+            addBattleLog(room, `**${card.name}** is destroyed at the start of **${owner?.name || 'its owner'}**'s turn.`, {
+                eventType: 'card-destroyed',
+                actorPlayerId: playerId,
+                targetPlayerId: card.ownerId,
+                targetCard: card,
+                base,
+                count: 1
+            });
             return false;
         });
     });
@@ -4844,6 +5375,7 @@ function queueAfterMinionPlayedBaseAbilities(room, base, playedMinion) {
                         type: 'baseDrawAfterMinionPlayed',
                         playerId: playedMinion.ownerId,
                         amount: effect.amount,
+                        sourceBaseId: base.id,
                         sourceBaseName: base.name
                     });
                 }
@@ -5055,7 +5587,11 @@ function processNextTriggeredAbility(room, roomId) {
         const cardsBeforeDraw = player?.hand.length || 0;
         drawCards(room, trigger.playerId, trigger.amount);
         if ((player?.hand.length || 0) > cardsBeforeDraw) {
-            addBattleLog(room, `**${player.name}** draws a card from **${trigger.sourceBaseName}**.`);
+            addBattleLog(room, `**${player.name}** draws a card from **${trigger.sourceBaseName}**.`, {
+                eventType: 'base-ability-used',
+                actorPlayerId: player.id,
+                baseEntityId: getBaseEntityId(trigger.sourceBaseId)
+            });
         }
         return processNextTriggeredAbility(room, roomId);
     }
@@ -5262,6 +5798,12 @@ function beginSpecialMinionPlay(room, roomId, socket, cardInstanceId, scoringBas
         card: playedCard,
         playerName: player.name,
         targetName: base.name
+    }, {
+        eventType: 'card-played',
+        actorPlayerId: player.id,
+        card: playedCard,
+        base,
+        count: 1
     });
 
     const deferredTriggerCount = room.triggerQueue?.length || 0;
@@ -5293,6 +5835,11 @@ function beginSpecialActionPlay(room, roomId, socket, cardInstanceId) {
         card: playedCard,
         playerName: player.name,
         targetName: null
+    }, {
+        eventType: 'card-played',
+        actorPlayerId: player.id,
+        card: playedCard,
+        count: 1
     });
     const deferredTriggerCount = room.triggerQueue?.length || 0;
     room.afterOnPlayResolution = () => {
@@ -5339,7 +5886,13 @@ function resolveTriggeredAbilityChoice(room, roomId, socket, choice) {
         const [action] = player.hand.splice(actionIndex, 1);
         const playedAction = { ...action, ownerId: player.id, ownerName: player.name };
         player.discardPile.push(playedAction);
-        addBattleLog(room, `**${player.name}** plays **${playedAction.name}** before **${pendingAbility.scoringBaseName}** scores.`);
+        addBattleLog(room, `**${player.name}** plays **${playedAction.name}** before **${pendingAbility.scoringBaseName}** scores.`, {
+            eventType: 'card-played',
+            actorPlayerId: player.id,
+            card: playedAction,
+            baseEntityId: getBaseEntityId(pendingAbility.scoringBaseId),
+            count: 1
+        });
         room.pendingAbility = {
             type: 'triggeredBeforeScoreHiddenNinjaMinion',
             playerId: socket.id,
@@ -5393,7 +5946,15 @@ function resolveTriggeredAbilityChoice(room, roomId, socket, choice) {
         sourceBase.playedCards = sourceBase.playedCards.filter(card => card.instanceId !== minion.instanceId);
         destinationBase.playedCards.push(minion);
         room.pendingAbility = null;
-        addBattleLog(room, `**${minion.name}** moves from **${sourceBase.name}** to **${destinationBase.name}** before scoring.`);
+        addBattleLog(room, `**${minion.name}** moves from **${sourceBase.name}** to **${destinationBase.name}** before scoring.`, {
+            eventType: 'card-moved',
+            actorPlayerId: socket.id,
+            targetPlayerId: minion.ownerId,
+            card: minion,
+            base: sourceBase,
+            destinationBase,
+            count: 1
+        });
         recalculateOngoingEffects(room);
         continueAfterTriggeredAbility(room, roomId);
         return true;
@@ -5406,7 +5967,13 @@ function resolveTriggeredAbilityChoice(room, roomId, socket, choice) {
         const player = room.players.find(candidate => candidate.id === socket.id);
         if (choice.choiceId === 'accept') {
             returnHeldScoredMinionToHand(room, minion.instanceId);
-            addBattleLog(room, `**${player?.name || 'A player'}** returns **${minion.name}** to their hand after scoring.`);
+            addBattleLog(room, `**${player?.name || 'A player'}** returns **${minion.name}** to their hand after scoring.`, {
+                eventType: 'card-returned-to-hand',
+                actorPlayerId: socket.id,
+                targetPlayerId: minion.ownerId,
+                card: minion,
+                count: 1
+            });
         } else {
             discardHeldScoredMinion(room, minion.instanceId);
         }
@@ -5452,7 +6019,17 @@ function resolveTriggeredAbilityChoice(room, roomId, socket, choice) {
         const minion = releaseHeldScoredMinion(room, pendingAbility.minionInstanceId);
         if (!minion) return false;
         destinationBase.playedCards.push(minion);
-        addBattleLog(room, `**${minion.name}** moves from **${pendingAbility.sourceBaseName}** to **${destinationBase.name}** after scoring.`);
+        addBattleLog(room, `**${minion.name}** moves from **${pendingAbility.sourceBaseName}** to **${destinationBase.name}** after scoring.`, {
+            eventType: 'card-moved',
+            actorPlayerId: socket.id,
+            targetPlayerId: minion.ownerId,
+            card: minion,
+            base: room.baseDiscardPile?.find(base => (
+                base.name === pendingAbility.sourceBaseName
+            )),
+            destinationBase,
+            count: 1
+        });
         room.pendingAbility = null;
         recalculateOngoingEffects(room);
         continueAfterTriggeredAbility(room, roomId);
@@ -5508,7 +6085,17 @@ function resolveTriggeredAbilityChoice(room, roomId, socket, choice) {
         pendingAbility.candidateMinions
             .filter(minion => minion.instanceId !== selectedMinion.instanceId)
             .forEach(minion => discardHeldScoredMinion(room, minion.instanceId));
-        addBattleLog(room, `**${selectedMinion.name}** moves from **${pendingAbility.sourceBaseName}** to **${destinationBase.name}**.`);
+        addBattleLog(room, `**${selectedMinion.name}** moves from **${pendingAbility.sourceBaseName}** to **${destinationBase.name}**.`, {
+            eventType: 'card-moved',
+            actorPlayerId: socket.id,
+            targetPlayerId: selectedMinion.ownerId,
+            card: selectedMinion,
+            base: room.baseDiscardPile?.find(base => (
+                base.name === pendingAbility.sourceBaseName
+            )),
+            destinationBase,
+            count: 1
+        });
         room.pendingAbility = null;
         recalculateOngoingEffects(room);
         continueAfterTriggeredAbility(room, roomId);
@@ -5526,7 +6113,11 @@ function resolveTriggeredAbilityChoice(room, roomId, socket, choice) {
                 });
             }
             const player = room.players.find(candidate => candidate.id === socket.id);
-            addBattleLog(room, `**${player?.name || 'A player'}** uses **${pendingAbility.sourceBaseName}**.`);
+            addBattleLog(room, `**${player?.name || 'A player'}** uses **${pendingAbility.sourceBaseName}**.`, {
+                eventType: 'base-ability-used',
+                actorPlayerId: socket.id,
+                baseEntityId: getBaseEntityId(room.activeBases[pendingAbility.baseIndex])
+            });
         }
         room.pendingAbility = null;
         continueAfterTriggeredAbility(room, roomId);
@@ -5571,7 +6162,15 @@ function resolveTriggeredAbilityChoice(room, roomId, socket, choice) {
         destinationBase.playedCards.push(minion);
         room.turnState.ongoingAbilityUses[pendingAbility.useKey] = true;
         room.pendingAbility = null;
-        addBattleLog(room, `**${minion.name}** moves from **${sourceBase.name}** to **${destinationBase.name}** instead of being destroyed.`);
+        addBattleLog(room, `**${minion.name}** moves from **${sourceBase.name}** to **${destinationBase.name}** instead of being destroyed.`, {
+            eventType: 'card-moved',
+            actorPlayerId: socket.id,
+            targetPlayerId: minion.ownerId,
+            card: minion,
+            base: sourceBase,
+            destinationBase,
+            count: 1
+        });
         recalculateOngoingEffects(room);
     } else {
         return false;
@@ -5625,7 +6224,10 @@ function replenishBaseDeck(room) {
 
     room.baseDeck = room.baseDiscardPile.splice(0);
     shuffleDeck(room.baseDeck, () => nextSeededRandom(room));
-    addBattleLog(room, '**The base discard pile** is shuffled to form a new base deck.');
+    addBattleLog(room, '**The base discard pile** is shuffled to form a new base deck.', {
+        eventType: 'base-deck-shuffled',
+        count: room.baseDeck.length
+    });
     return true;
 }
 
@@ -5727,6 +6329,13 @@ function scoreBase(room, baseIndex) {
                 const victoryPoints = base.vp[rank];
                 targetPlayer.vp += victoryPoints;
                 vpAwards.push(formatVictoryPointAward(targetPlayer.name, victoryPoints));
+                recordStructuredEvent(room, {
+                    eventType: 'victory-points-awarded',
+                    actorPlayerId: targetPlayer.id,
+                    base,
+                    amount: victoryPoints,
+                    count: rank + 1
+                });
             }
         }
     });
@@ -5771,6 +6380,13 @@ function scoreBase(room, baseIndex) {
     } else {
         room.activeBases.splice(baseIndex, 1);
     }
+    recordStructuredEvent(room, {
+        eventType: 'base-scored',
+        actorPlayerId: winnerId,
+        base,
+        destinationBase: newBase,
+        count: rankedPlayers.length
+    });
 
     if (!room.triggerQueue) room.triggerQueue = [];
     const triggersByPlayer = new Map(room.players.map(player => [player.id, []]));
@@ -5941,9 +6557,11 @@ module.exports = {
     finishGameIfNeeded,
     finalizeRoomTrajectory,
     getCompletedGameResult,
+    getLegalActionEncodingKey,
     getLegalActions,
     getBotDecisionActorId,
     getPlayerObservation,
+    getRecentStructuredEvents,
     getRoomTrajectory,
     getOngoingDiscardPlayBaseIndices,
     isMinionPlayPrevented,
@@ -5956,6 +6574,7 @@ module.exports = {
     queueRevealedDeckSelection,
     queueSelectedPlayerBoardEffect,
     recordTrajectoryDecision,
+    recordStructuredEvent,
     recalculateOngoingEffects,
     resolveEndTurnActions,
     resolveDeckReorder,

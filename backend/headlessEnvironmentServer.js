@@ -1,4 +1,6 @@
 const { randomUUID } = require('node:crypto');
+const fs = require('node:fs/promises');
+const path = require('node:path');
 const express = require('express');
 const {
     DEFAULT_HEADLESS_PLAYER_COUNT,
@@ -8,7 +10,105 @@ const {
 
 const DEFAULT_ENVIRONMENT_PORT = 3001;
 const DEFAULT_ENVIRONMENT_HOST = '127.0.0.1';
+const HEADLESS_PROTOCOL_VERSION = 2;
 const EXTERNAL_PYTHON_POLICY_VERSION = 'external-python-v1';
+const DEFAULT_TRAJECTORY_DIRECTORY = path.resolve(
+    __dirname,
+    '../training-data/trajectories'
+);
+
+function safeFilenamePart(value, fallback) {
+    const sanitized = String(value ?? '')
+        .toLowerCase()
+        .replace(/[^a-z0-9_-]+/g, '-')
+        .replace(/^-+|-+$/g, '')
+        .slice(0, 80);
+    return sanitized || fallback;
+}
+
+async function writeTrajectoryFile(directory, basename, contents) {
+    await fs.mkdir(directory, { recursive: true });
+    for (let suffix = 0; suffix < 10_000; suffix += 1) {
+        const filename = `${basename}${suffix === 0 ? '' : `-${suffix}`}.json`;
+        const filePath = path.join(directory, filename);
+        try {
+            await fs.writeFile(filePath, contents, { encoding: 'utf8', flag: 'wx' });
+            return { filePath, filename };
+        } catch (error) {
+            if (error.code !== 'EEXIST') throw error;
+        }
+    }
+    throw new Error('Could not allocate a unique trajectory filename.');
+}
+
+async function saveCompletedTrajectory(environment, {
+    directory = DEFAULT_TRAJECTORY_DIRECTORY,
+    environmentId = 'environment'
+} = {}) {
+    if (!environment) {
+        return {
+            ok: false,
+            code: 'environment_not_found',
+            error: 'Headless environment not found.'
+        };
+    }
+    if (!environment.terminated && !environment.truncated) {
+        return {
+            ok: false,
+            code: 'trajectory_not_complete',
+            error: 'The trajectory can only be saved after the episode terminates or truncates.'
+        };
+    }
+
+    const result = environment.getResult();
+    if (!result?.trajectory) {
+        return {
+            ok: false,
+            code: 'trajectory_not_recorded',
+            error: 'This environment was created with trajectory recording disabled.'
+        };
+    }
+    if (
+        environment.savedTrajectoryExport
+        && environment.savedTrajectoryExport.roomId === result.roomId
+    ) {
+        return {
+            ok: true,
+            alreadySaved: true,
+            ...environment.savedTrajectoryExport
+        };
+    }
+
+    const roomPart = safeFilenamePart(result.roomId, 'game');
+    const seedPart = safeFilenamePart(result.room.randomSeed, 'seed');
+    const environmentPart = safeFilenamePart(environmentId, 'environment').slice(0, 16);
+    const basename = [
+        'trajectory',
+        roomPart,
+        `seed-${seedPart}`,
+        `decisions-${result.decisionCount}`,
+        environmentPart
+    ].join('-');
+    const contents = `${JSON.stringify(result.trajectory)}\n`;
+    const { filePath, filename } = await writeTrajectoryFile(directory, basename, contents);
+    const projectRoot = path.resolve(__dirname, '..');
+    const relativePath = path.relative(projectRoot, filePath);
+    const responsePath = relativePath.startsWith('..') || path.isAbsolute(relativePath)
+        ? filename
+        : relativePath;
+    const saved = {
+        roomId: result.roomId,
+        filename,
+        path: responsePath,
+        schemaVersion: result.trajectory.schemaVersion,
+        decisionCount: result.decisionCount,
+        terminated: result.terminated,
+        truncated: result.truncated,
+        terminationReason: result.terminationReason
+    };
+    environment.savedTrajectoryExport = saved;
+    return { ok: true, alreadySaved: false, ...saved };
+}
 
 function createHeadlessEnvironmentManager({ idFactory = randomUUID } = {}) {
     const environments = new Map();
@@ -69,7 +169,10 @@ function getEnvironmentSummary(environment) {
     };
 }
 
-function createHeadlessEnvironmentApp({ manager = createHeadlessEnvironmentManager() } = {}) {
+function createHeadlessEnvironmentApp({
+    manager = createHeadlessEnvironmentManager(),
+    trajectoryDirectory = DEFAULT_TRAJECTORY_DIRECTORY
+} = {}) {
     const app = express();
     app.use(express.json({ limit: '2mb' }));
 
@@ -77,7 +180,7 @@ function createHeadlessEnvironmentApp({ manager = createHeadlessEnvironmentManag
         response.status(200).json({
             status: 'ok',
             activeEnvironments: manager.size(),
-            protocolVersion: 1
+            protocolVersion: HEADLESS_PROTOCOL_VERSION
         });
     });
 
@@ -138,6 +241,28 @@ function createHeadlessEnvironmentApp({ manager = createHeadlessEnvironmentManag
         });
     });
 
+    app.post('/environments/:environmentId/trajectory', async (request, response, next) => {
+        try {
+            const saved = await saveCompletedTrajectory(
+                manager.get(request.params.environmentId),
+                {
+                    directory: trajectoryDirectory,
+                    environmentId: request.params.environmentId
+                }
+            );
+            if (!saved.ok) {
+                const status = saved.code === 'environment_not_found' ? 404 : 409;
+                return response.status(status).json({ code: saved.code, error: saved.error });
+            }
+            return response.status(saved.alreadySaved ? 200 : 201).json({
+                environmentId: request.params.environmentId,
+                ...saved
+            });
+        } catch (error) {
+            return next(error);
+        }
+    });
+
     app.delete('/environments/:environmentId', (request, response) => {
         if (!manager.delete(request.params.environmentId)) {
             return response.status(404).json({
@@ -175,9 +300,12 @@ if (require.main === module) startHeadlessEnvironmentServer();
 module.exports = {
     DEFAULT_ENVIRONMENT_HOST,
     DEFAULT_ENVIRONMENT_PORT,
+    DEFAULT_TRAJECTORY_DIRECTORY,
     EXTERNAL_PYTHON_POLICY_VERSION,
+    HEADLESS_PROTOCOL_VERSION,
     createHeadlessEnvironmentApp,
     createHeadlessEnvironmentManager,
     getEnvironmentSummary,
+    saveCompletedTrajectory,
     startHeadlessEnvironmentServer
 };

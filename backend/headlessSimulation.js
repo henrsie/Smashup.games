@@ -85,6 +85,8 @@ function createHeadlessRoom({
         baseDeck: [],
         baseDiscardPile: [],
         battleLog: [],
+        structuredEvents: [],
+        nextStructuredEventNumber: 0,
         chatMessages: [],
         pendingAbility: null,
         temporaryEffects: [],
@@ -139,6 +141,7 @@ class HeadlessSimulationEnvironment {
         this.truncated = false;
         this.recordTrajectory = recordTrajectory;
         this.maxDecisions = maxDecisions;
+        this.savedTrajectoryExport = null;
     }
 
     reset({
@@ -188,6 +191,7 @@ class HeadlessSimulationEnvironment {
         this.truncated = false;
         this.recordTrajectory = recordTrajectory;
         this.maxDecisions = maxDecisions;
+        this.savedTrajectoryExport = null;
 
         if (this.terminated) {
             return {

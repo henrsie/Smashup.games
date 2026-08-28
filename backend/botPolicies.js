@@ -1,6 +1,7 @@
 const { systemRandom } = require('./random.js');
 
 const BOT_POLICY_VERSIONS = Object.freeze({
+    FIRST_LEGAL: 'first-legal-v1',
     RANDOM: 'random-v1',
     GREEDY_HEURISTIC_1: 'greedy_heuristic_1',
     GREEDY_HEURISTIC_2: 'greedy_heuristic_2'
@@ -13,6 +14,21 @@ function chooseRandomCandidateIndex(candidateIndices, random = systemRandom) {
         candidateIndices.length - 1
     );
     return candidateIndices[randomIndex];
+}
+
+function chooseFirstLegalActionIndex({
+    legalActions,
+    observation,
+    random = systemRandom
+}) {
+    if (!legalActions.length) return null;
+    if (observation?.gamePhase === 'drafting') {
+        return chooseRandomCandidateIndex(
+            legalActions.map((action, actionIndex) => actionIndex),
+            random
+        );
+    }
+    return 0;
 }
 
 function chooseRandomActionIndex({ legalActions, random = systemRandom }) {
@@ -182,6 +198,9 @@ function chooseGreedyHeuristic2ActionIndex(context) {
 }
 
 function getBotPolicy(policyVersion) {
+    if (policyVersion === BOT_POLICY_VERSIONS.FIRST_LEGAL) {
+        return chooseFirstLegalActionIndex;
+    }
     if (policyVersion === BOT_POLICY_VERSIONS.GREEDY_HEURISTIC_1) {
         return chooseGreedyHeuristic1ActionIndex;
     }
@@ -194,6 +213,7 @@ function getBotPolicy(policyVersion) {
 
 module.exports = {
     BOT_POLICY_VERSIONS,
+    chooseFirstLegalActionIndex,
     chooseGreedyHeuristic1ActionIndex,
     chooseGreedyHeuristic2ActionIndex,
     chooseRandomActionIndex,

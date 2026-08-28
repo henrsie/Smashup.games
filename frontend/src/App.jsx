@@ -16,12 +16,14 @@ const DEFAULT_TURN_STATE = {
 };
 const MINION_TARGETING_MODES = ['ally-minion', 'enemy-minion', 'neutral-minion'];
 const BOT_POLICY_OPTIONS = [
+  { value: 'first-legal-v1', label: 'First legal action' },
   { value: 'random-v1', label: 'Random' },
   { value: 'greedy_heuristic_1', label: 'Greedy heuristic 1' },
   { value: 'greedy_heuristic_2', label: 'Greedy heuristic 2' }
 ];
 const BOT_POLICY_LABELS = Object.fromEntries(BOT_POLICY_OPTIONS.map(option => [option.value, option.label]));
 const BOT_POLICY_DESCRIPTIONS = {
+  'first-legal-v1': 'Always chooses the first legal gameplay action.',
   'random-v1': 'Chooses randomly from every legal action.',
   greedy_heuristic_1: 'Plays stronger minions toward the bases with the most power.',
   greedy_heuristic_2: 'Plays stronger minions toward the bases with the least power.'

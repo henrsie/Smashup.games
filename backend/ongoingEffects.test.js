@@ -7,6 +7,7 @@ const {
     appendChatMessage,
     baseAbilitiesAreCancelled,
     createInitialTurnState,
+    getLegalActions,
     getOngoingDiscardPlayBaseIndices,
     isMinionPlayPrevented,
     isMinionProtectedFromCard,
@@ -132,6 +133,8 @@ test('each Talent can only be used once per turn', () => {
 test('Ninja Acolyte returns itself and requires an immediate extra minion at its base', () => {
     const acolyte = createCard('ninja_acolyte_1', 'player-1');
     const room = createRoom([createBase('base_the_homeworld', [acolyte])]);
+    room.gamePhase = 'playing';
+    room.currentTurnPlayerId = 'player-1';
 
     assert.deepEqual(activateTalent(room, 'player-1', acolyte.instanceId), { ok: true });
     assert.equal(room.activeBases[0].playedCards.length, 0);
@@ -152,6 +155,25 @@ test('Ninja Acolyte Talent is unavailable after the normal minion play', () => {
 
     assert.equal(activateTalent(room, 'player-1', acolyte.instanceId).ok, false);
     assert.equal(room.activeBases[0].playedCards[0].instanceId, acolyte.instanceId);
+});
+
+test('Ninja Acolyte Talent is unavailable when no minion can be played at its base', () => {
+    const acolyte = createCard('ninja_acolyte_1', 'player-1');
+    const overrun = createCard('zombie_overrun_1', 'player-2');
+    const room = createRoom([createBase('base_the_homeworld', [acolyte, overrun])]);
+    room.gamePhase = 'playing';
+    room.currentTurnPlayerId = 'player-1';
+    room.players[0].hand.push(createCard('robot_microbot_guard_1', 'player-1'));
+
+    const legalActions = getLegalActions(room, 'player-1');
+
+    assert.equal(legalActions.some(action => (
+        action.type === 'use-talent' && action.cardInstanceId === acolyte.instanceId
+    )), false);
+    assert.equal(legalActions.some(action => action.type === 'end-turn'), true);
+    assert.equal(activateTalent(room, 'player-1', acolyte.instanceId).ok, false);
+    assert.equal(room.activeBases[0].playedCards.some(card => card.instanceId === acolyte.instanceId), true);
+    assert.equal(room.turnState.extraMinionPlays.length, 0);
 });
 
 test('ongoing power effects are recalculated from printed power', () => {
@@ -238,11 +260,14 @@ test('start-turn self-destruction removes Overrun and Infiltrate', () => {
 test('end-turn attached destruction and Nukebot reactions resolve', () => {
     const nukebot = createCard('robot_nukebot_1', 'player-1');
     nukebot.attachedCards.push(createCard('ninja_assassination_1', 'player-2'));
+    const ally = createCard('robot_microbot_guard_1', 'player-1');
     const enemy = createCard('dino_king_1', 'player-2');
-    const room = createRoom([createBase('base_the_homeworld', [nukebot, enemy])]);
+    const room = createRoom([createBase('base_the_homeworld', [nukebot, ally, enemy])]);
 
     resolveEndTurnActions(room);
-    assert.equal(room.activeBases[0].playedCards.length, 0);
+    assert.deepEqual(room.activeBases[0].playedCards.map(card => card.cardId), [
+        'robot_microbot_guard_1'
+    ]);
     assert.deepEqual(room.players[0].discardPile.map(card => card.cardId), ['robot_nukebot_1']);
     assert.deepEqual(room.players[1].discardPile.map(card => card.cardId).sort(), [
         'dino_king_1',

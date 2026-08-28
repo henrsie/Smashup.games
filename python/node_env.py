@@ -107,6 +107,16 @@ class NodeSmashUpEnv:
             f"/environments/{self.environment_id}/result",
         ) or {}
 
+    def save_trajectory(self) -> dict[str, Any]:
+        """Ask Node to persist the completed recorded trajectory to training-data."""
+        if self.environment_id is None:
+            raise NodeEnvironmentError("Call reset() before saving a trajectory.")
+        return self._request(
+            "POST",
+            f"/environments/{self.environment_id}/trajectory",
+            {},
+        ) or {}
+
     def close(self) -> None:
         if self.environment_id is None:
             return

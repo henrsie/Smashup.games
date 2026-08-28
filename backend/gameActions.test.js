@@ -1,6 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { factionsData } = require('./factions.js');
+const { CHOICE_TYPE_IDS } = require('./gameEntityIds.js');
 const { initializeSeededRandom, nextSeededRandom } = require('./random.js');
 const {
     MAX_HAND_SIZE,
@@ -15,9 +16,11 @@ const {
     finalizeRoomTrajectory,
     getBotDecisionActorId,
     getCompletedGameResult,
+    getLegalActionEncodingKey,
     getLegalActions,
     getPlayerObservation,
     getRoomTrajectory,
+    recordStructuredEvent,
     recordTrajectoryDecision,
     scoreBase,
     validatePlayCardAction
@@ -925,6 +928,37 @@ test('getLegalActions returns executable card, Talent, and end-turn actions', ()
     assert.equal(getLegalActions(room, 'human-1').length, 0);
 });
 
+test('legal-action model encodings distinguish duplicate cards and decision outcomes', () => {
+    const room = createRoom();
+    room.players[0].hand.push(
+        createCard('robot_zapbot_1', 'bot-1', 'zapbot-copy-1'),
+        createCard('robot_zapbot_1', 'bot-1', 'zapbot-copy-2')
+    );
+
+    const cardActions = getLegalActions(room, 'bot-1')
+        .filter(action => action.type === 'play-card');
+    const cardActionKeys = cardActions.map(getLegalActionEncodingKey);
+    assert.equal(new Set(cardActionKeys).size, cardActionKeys.length);
+    assert.notEqual(
+        cardActions[0].choiceFeatures.sourceCardPosition,
+        cardActions[1].choiceFeatures.sourceCardPosition
+    );
+
+    room.pendingAbility = {
+        type: 'triggeredOptionalDraw',
+        playerId: 'bot-1'
+    };
+    const decisionActions = getLegalActions(room, 'bot-1');
+    assert.deepEqual(decisionActions.map(action => action.choiceTypeId), [
+        CHOICE_TYPE_IDS.accept,
+        CHOICE_TYPE_IDS.skip
+    ]);
+    assert.equal(
+        new Set(decisionActions.map(getLegalActionEncodingKey)).size,
+        decisionActions.length
+    );
+});
+
 test('getLegalActions enforces a required extra minion play', () => {
     const room = createRoom();
     const acolyte = createCard('ninja_acolyte_1', 'bot-1');
@@ -1155,30 +1189,17 @@ test('getLegalActions returns all available factions only for the current drafte
         picks: { 'bot-1': [] }
     };
 
-    assert.deepEqual(getLegalActions(room, 'bot-1'), [
-        {
-            type: 'draft-faction',
-            factionName: 'Aliens',
-            entityIds: {
-                cardEntityId: 0,
-                targetCardEntityId: 0,
-                baseEntityId: 0,
-                factionEntityId: 2,
-                selectedCardEntityIds: []
-            }
-        },
-        {
-            type: 'draft-faction',
-            factionName: 'Dinosaurs',
-            entityIds: {
-                cardEntityId: 0,
-                targetCardEntityId: 0,
-                baseEntityId: 0,
-                factionEntityId: 1,
-                selectedCardEntityIds: []
-            }
-        }
+    const legalActions = getLegalActions(room, 'bot-1');
+    assert.deepEqual(legalActions.map(action => ({
+        type: action.type,
+        factionName: action.factionName,
+        actionTypeId: action.actionTypeId,
+        factionEntityId: action.entityIds.factionEntityId
+    })), [
+        { type: 'draft-faction', factionName: 'Aliens', actionTypeId: 4, factionEntityId: 2 },
+        { type: 'draft-faction', factionName: 'Dinosaurs', actionTypeId: 4, factionEntityId: 1 }
     ]);
+    assert.ok(legalActions.every(action => action.choiceTypeId > 0));
     assert.equal(getLegalActions(room, 'human-1').length, 0);
 });
 
@@ -1246,6 +1267,67 @@ test('getPlayerObservation returns an immutable snapshot with private pending ch
     assert.equal(room.baseDiscardPile[0].name, 'Discarded Base');
     assert.deepEqual(room.pendingAbility.candidateIds, ['target-1']);
     assert.equal(getPlayerObservation(room, 'missing-player'), null);
+});
+
+test('structured events expose ordered entity IDs without leaking private choices', () => {
+    const room = createRoom();
+    const privateCard = createCard('dino_king_1', 'bot-1', 'private-choice-card');
+    room.players[0].hand.push(privateCard);
+
+    recordStructuredEvent(room, {
+        eventType: 'ability-choice-made',
+        actorPlayerId: 'bot-1',
+        card: privateCard,
+        privateEntityPlayerId: 'bot-1'
+    });
+    recordStructuredEvent(room, {
+        eventType: 'turn-ended',
+        actorPlayerId: 'bot-1'
+    });
+
+    const actorEvents = getPlayerObservation(room, 'bot-1').recentEvents;
+    const opponentEvents = getPlayerObservation(room, 'human-1').recentEvents;
+
+    assert.equal(actorEvents.length, 2);
+    assert.deepEqual(actorEvents.map(event => event.sequenceNumber), [0, 1]);
+    assert.equal(actorEvents[0].eventType, 'ability-choice-made');
+    assert.ok(actorEvents[0].eventTypeId > 0);
+    assert.ok(actorEvents[0].cardEntityId > 0);
+    assert.equal(opponentEvents[0].cardEntityId, 0);
+    assert.equal(JSON.stringify(opponentEvents).includes('privateEntityPlayerId'), false);
+});
+
+test('successful gameplay decisions and public card plays enter structured history', () => {
+    const room = createRoom();
+    const kingRex = createCard('dino_king_1', 'bot-1', 'structured-king-rex');
+    room.players[0].hand.push(kingRex);
+
+    const playResult = executeGameAction({
+        room,
+        roomId: 'ROOM1',
+        actorId: 'bot-1',
+        action: {
+            type: 'play-card',
+            cardInstanceId: kingRex.instanceId,
+            baseIndex: 0
+        }
+    });
+    const endTurnResult = executeGameAction({
+        room,
+        roomId: 'ROOM1',
+        actorId: 'bot-1',
+        action: { type: 'end-turn' }
+    });
+
+    assert.equal(playResult.ok, true);
+    assert.equal(endTurnResult.ok, true);
+    const observation = getPlayerObservation(room, 'human-1');
+    const playEvent = observation.recentEvents.find(event => event.eventType === 'card-played');
+    assert.ok(playEvent.cardEntityId > 0);
+    assert.equal(playEvent.actorSeatIndex, 0);
+    assert.ok(playEvent.baseEntityId >= 0);
+    assert.ok(observation.recentEvents.some(event => event.eventType === 'turn-ended'));
+    assert.ok(observation.recentEvents.some(event => event.eventType === 'turn-started'));
 });
 
 test('decision metadata groups follow-up choices into one resolution', () => {
@@ -1322,11 +1404,13 @@ test('the trajectory links consecutive player decisions and records VP rewards',
     });
 
     const activeTrajectory = getRoomTrajectory(room);
-    assert.equal(activeTrajectory.schemaVersion, 4);
+    assert.equal(activeTrajectory.schemaVersion, 5);
     assert.equal(activeTrajectory.gameId, 'ROOM1');
-    assert.equal(activeTrajectory.metadata.trajectorySchemaVersion, 4);
-    assert.equal(activeTrajectory.metadata.observationSchemaVersion, 4);
-    assert.equal(activeTrajectory.metadata.entityIdSchemaVersion, 1);
+    assert.equal(activeTrajectory.metadata.trajectorySchemaVersion, 5);
+    assert.equal(activeTrajectory.metadata.observationSchemaVersion, 5);
+    assert.equal(activeTrajectory.metadata.entityIdSchemaVersion, 4);
+    assert.equal(activeTrajectory.metadata.eventSchemaVersion, 1);
+    assert.equal(activeTrajectory.metadata.eventHistorySource, 'native-v1');
     assert.equal(activeTrajectory.metadata.policyVersion, 'random-v1');
     assert.equal(activeTrajectory.metadata.randomSeed, 123456);
     assert.equal(activeTrajectory.metadata.randomAlgorithm, 'mulberry32-v1');
@@ -1479,15 +1563,15 @@ test('the bot controller notices and completes a normal bot turn', async () => {
     const trajectory = getRoomTrajectory(room);
     assert.equal(trajectory.entries.length, 1);
     assert.equal(trajectory.entries[0].playerId, 'bot-1');
-    assert.deepEqual(trajectory.entries[0].chosenAction, {
-        type: 'end-turn',
-        entityIds: {
-            cardEntityId: 0,
-            targetCardEntityId: 0,
-            baseEntityId: 0,
-            factionEntityId: 0,
-            selectedCardEntityIds: []
-        }
+    assert.equal(trajectory.entries[0].chosenAction.type, 'end-turn');
+    assert.equal(trajectory.entries[0].chosenAction.actionTypeId, 5);
+    assert.equal(trajectory.entries[0].chosenAction.choiceTypeId, 1);
+    assert.deepEqual(trajectory.entries[0].chosenAction.entityIds, {
+        cardEntityId: 0,
+        targetCardEntityId: 0,
+        baseEntityId: 0,
+        factionEntityId: 0,
+        selectedCardEntityIds: []
     });
     assert.equal(trajectory.entries[0].observation.isObserverTurn, true);
 });

@@ -2,11 +2,35 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const {
     BOT_POLICY_VERSIONS,
+    chooseFirstLegalActionIndex,
     chooseGreedyHeuristic1ActionIndex,
     chooseGreedyHeuristic2ActionIndex,
     getBotPolicy,
     getExtraPlayCount
 } = require('./botPolicies.js');
+
+test('first-legal policy chooses the first gameplay action but drafts randomly', () => {
+    const legalActions = [
+        { type: 'play-card', cardInstanceId: 'minion-1', baseIndex: 0 },
+        { type: 'end-turn' }
+    ];
+
+    assert.equal(chooseFirstLegalActionIndex({
+        legalActions,
+        observation: { gamePhase: 'playing' },
+        random: () => 0.99
+    }), 0);
+    assert.equal(chooseFirstLegalActionIndex({
+        legalActions,
+        observation: { gamePhase: 'drafting' },
+        random: () => 0.99
+    }), 1);
+    assert.equal(chooseFirstLegalActionIndex({ legalActions: [] }), null);
+    assert.equal(
+        getBotPolicy(BOT_POLICY_VERSIONS.FIRST_LEGAL),
+        chooseFirstLegalActionIndex
+    );
+});
 
 function createObservation({ hand = [], activeBases = [], pendingDecision = null } = {}) {
     return {
