@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import math
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Optional
@@ -14,6 +15,10 @@ REGISTRY_PATH = Path(__file__).resolve().parents[1] / "shared" / "gameEntityIds.
 TARGET_TRAJECTORY_SCHEMA_VERSION = 5
 TARGET_OBSERVATION_SCHEMA_VERSION = 5
 TARGET_EVENT_SCHEMA_VERSION = 1
+TARGET_REWARD_SCHEMA_VERSION = 2
+VICTORY_POINT_REWARD_SCALE = 1.0 / 15.0
+WIN_REWARD = 1.0
+LOSS_REWARD = -1.0
 RECENT_EVENT_LIMIT = 32
 SUPPORTED_SOURCE_TRAJECTORY_VERSION = 4
 SUPPORTED_CURRENT_ENTITY_SCHEMA_VERSION = 3
@@ -601,12 +606,46 @@ def _set_observation_entity_schema(value: Any, schema_version: int) -> Any:
     return observation
 
 
+def _is_finite_number(value: Any) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+    )
+
+
+def _normalize_entry_rewards(entries: list[Any]) -> list[Any]:
+    normalized_entries = []
+    for raw_entry in entries:
+        if not isinstance(raw_entry, Mapping):
+            normalized_entries.append(raw_entry)
+            continue
+        entry = copy.deepcopy(dict(raw_entry))
+        raw_vp_reward = entry.get("vpReward")
+        terminal_reward = entry.get("terminalReward")
+        if _is_finite_number(raw_vp_reward):
+            entry["vpReward"] = float(raw_vp_reward) * VICTORY_POINT_REWARD_SCALE
+        if _is_finite_number(entry.get("vpReward")) and _is_finite_number(terminal_reward):
+            entry["reward"] = float(entry["vpReward"]) + float(terminal_reward)
+        normalized_entries.append(entry)
+    return normalized_entries
+
+
+def _set_normalized_reward_metadata(metadata: dict[str, Any]) -> None:
+    metadata.update({
+        "rewardSchemaVersion": TARGET_REWARD_SCHEMA_VERSION,
+        "victoryPointRewardScale": VICTORY_POINT_REWARD_SCALE,
+        "winReward": WIN_REWARD,
+        "lossReward": LOSS_REWARD,
+    })
+
+
 def migrate_trajectory(
     trajectory: Mapping[str, Any],
     *,
     registry_path: Path | str = REGISTRY_PATH,
 ) -> dict[str, Any]:
-    """Return a migrated copy of one v4 trajectory.
+    """Return a copy upgraded to the current entity, event, and reward schemas.
 
     Old prose cannot recreate automatic outcomes exactly, so the structured event
     history is backfilled from chosen decisions and inferred turn boundaries. The
@@ -621,29 +660,50 @@ def migrate_trajectory(
 
     if source_version == TARGET_TRAJECTORY_SCHEMA_VERSION:
         source_entity_version = metadata.get("entityIdSchemaVersion")
-        if source_entity_version == registry["schemaVersion"]:
-            return migrated
-        if source_entity_version != SUPPORTED_CURRENT_ENTITY_SCHEMA_VERSION:
+        if source_entity_version not in (
+            registry["schemaVersion"],
+            SUPPORTED_CURRENT_ENTITY_SCHEMA_VERSION,
+        ):
             raise ValueError("The v5 trajectory uses an incompatible entity registry.")
-        upgraded_entries = []
-        for raw_entry in _list(migrated.get("entries")):
-            if not isinstance(raw_entry, Mapping):
-                raise ValueError("trajectory entries must be mappings.")
-            entry = copy.deepcopy(dict(raw_entry))
-            entry["observation"] = _set_observation_entity_schema(
-                entry.get("observation"), registry["schemaVersion"]
-            )
-            entry["nextObservation"] = _set_observation_entity_schema(
-                entry.get("nextObservation"), registry["schemaVersion"]
-            )
-            upgraded_entries.append(_upgrade_entry_actions(entry, registry))
+        source_reward_version = metadata.get("rewardSchemaVersion", 1)
+        if source_reward_version not in (1, TARGET_REWARD_SCHEMA_VERSION):
+            raise ValueError("The v5 trajectory uses an incompatible reward schema.")
+        if (
+            source_entity_version == registry["schemaVersion"]
+            and source_reward_version == TARGET_REWARD_SCHEMA_VERSION
+        ):
+            return migrated
+
+        upgraded_entries = copy.deepcopy(_list(migrated.get("entries")))
+        if source_entity_version == SUPPORTED_CURRENT_ENTITY_SCHEMA_VERSION:
+            entity_upgraded_entries = []
+            for raw_entry in upgraded_entries:
+                if not isinstance(raw_entry, Mapping):
+                    raise ValueError("trajectory entries must be mappings.")
+                entry = copy.deepcopy(dict(raw_entry))
+                entry["observation"] = _set_observation_entity_schema(
+                    entry.get("observation"), registry["schemaVersion"]
+                )
+                entry["nextObservation"] = _set_observation_entity_schema(
+                    entry.get("nextObservation"), registry["schemaVersion"]
+                )
+                entity_upgraded_entries.append(_upgrade_entry_actions(entry, registry))
+            upgraded_entries = entity_upgraded_entries
+            metadata["entityIdSchemaVersion"] = registry["schemaVersion"]
+            metadata["actionEncodingSource"] = "choice-features-backfill-v1"
+            metadata["entityMigration"] = {
+                "sourceEntityIdSchemaVersion": source_entity_version,
+                "targetEntityIdSchemaVersion": registry["schemaVersion"],
+            }
+        if source_reward_version == 1:
+            upgraded_entries = _normalize_entry_rewards(upgraded_entries)
+            _set_normalized_reward_metadata(metadata)
+            metadata["rewardMigration"] = {
+                "sourceRewardSchemaVersion": source_reward_version,
+                "targetRewardSchemaVersion": TARGET_REWARD_SCHEMA_VERSION,
+                "strategy": "divide-vp-rewards-by-15-v1",
+            }
         migrated["entries"] = upgraded_entries
-        metadata["entityIdSchemaVersion"] = registry["schemaVersion"]
-        metadata["actionEncodingSource"] = "choice-features-backfill-v1"
-        metadata["entityMigration"] = {
-            "sourceEntityIdSchemaVersion": source_entity_version,
-            "targetEntityIdSchemaVersion": registry["schemaVersion"],
-        }
         migrated["metadata"] = metadata
         return migrated
     if source_version != SUPPORTED_SOURCE_TRAJECTORY_VERSION:
@@ -720,8 +780,16 @@ def migrate_trajectory(
             )
         migrated_entries.append(_upgrade_entry_actions(entry, registry))
 
+    source_reward_schema_version = metadata.get("rewardSchemaVersion", 1)
+    if source_reward_schema_version not in (1, TARGET_REWARD_SCHEMA_VERSION):
+        raise ValueError("The v4 trajectory uses an incompatible reward schema.")
     migrated["schemaVersion"] = TARGET_TRAJECTORY_SCHEMA_VERSION
-    migrated["entries"] = migrated_entries
+    migrated["entries"] = (
+        _normalize_entry_rewards(migrated_entries)
+        if source_reward_schema_version == 1
+        else migrated_entries
+    )
+    _set_normalized_reward_metadata(metadata)
     metadata.update({
         "trajectorySchemaVersion": TARGET_TRAJECTORY_SCHEMA_VERSION,
         "observationSchemaVersion": TARGET_OBSERVATION_SCHEMA_VERSION,
@@ -732,6 +800,7 @@ def migrate_trajectory(
             "sourceTrajectorySchemaVersion": source_version,
             "sourceObservationSchemaVersion": metadata.get("observationSchemaVersion"),
             "sourceEntityIdSchemaVersion": metadata.get("entityIdSchemaVersion"),
+            "sourceRewardSchemaVersion": source_reward_schema_version,
             "strategy": "decision-backfill-v1",
             "automaticOutcomeEventsReconstructed": False,
         },
@@ -768,7 +837,7 @@ def migrate_trajectory_file(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Migrate one Smash Up trajectory from schema v4 to v5."
+        description="Upgrade one older Smash Up trajectory to the current schemas."
     )
     parser.add_argument("input", type=Path, help="Existing trajectory JSON file")
     parser.add_argument("output", type=Path, help="Destination for migrated JSON")

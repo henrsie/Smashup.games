@@ -5,6 +5,7 @@ const {
     finalizeRoomTrajectory,
     getBotDecisionActorId,
     getLegalActions,
+    getNormalizedVictoryPointReward,
     getPlayerObservation,
     getRoomTrajectory,
     recordTrajectoryDecision
@@ -242,6 +243,35 @@ class HeadlessSimulationEnvironment {
         };
     }
 
+    chooseBuiltInPolicyAction(policyVersion) {
+        if (!this.room) throw new Error('Call reset() before choosing an action.');
+        if (this.terminated || this.truncated || !this.currentDecision) {
+            throw new Error('Cannot choose an action after the episode has ended.');
+        }
+        const policy = getBotPolicy(policyVersion);
+        if (!policy) throw new RangeError(`Unsupported built-in bot policy: ${policyVersion}`);
+
+        const { actorId, observation, legalActions } = this.currentDecision;
+        const actionIndex = policy({
+            actorId,
+            legalActions,
+            observation,
+            random: () => nextSeededRandom(this.room),
+            room: this.room,
+            roomId: this.roomId
+        });
+        if (!Number.isInteger(actionIndex)
+            || actionIndex < 0
+            || actionIndex >= legalActions.length) {
+            throw new Error(`Built-in policy ${policyVersion} selected an invalid action index.`);
+        }
+        return {
+            actionIndex,
+            actorId,
+            policyVersion
+        };
+    }
+
     step(actionIndex) {
         if (!this.room) throw new Error('Call reset() before step().');
         if (this.terminated || this.truncated) {
@@ -297,9 +327,13 @@ class HeadlessSimulationEnvironment {
             });
         }
 
-        const vpRewardsByPlayer = Object.fromEntries(this.room.players.map(player => [
+        const victoryPointChangesByPlayer = Object.fromEntries(this.room.players.map(player => [
             player.id,
             (Number.isFinite(player.vp) ? player.vp : 0) - (victoryPointsBefore[player.id] || 0)
+        ]));
+        const vpRewardsByPlayer = Object.fromEntries(this.room.players.map(player => [
+            player.id,
+            getNormalizedVictoryPointReward(0, victoryPointChangesByPlayer[player.id])
         ]));
         const terminalRewardsByPlayer = this.terminated
             ? cloneJson(this.room.terminalRewards || {})
@@ -349,6 +383,7 @@ class HeadlessSimulationEnvironment {
                 rewardsByPlayer,
                 stepIndex: observation.stepIndex,
                 terminalRewardsByPlayer,
+                victoryPointChangesByPlayer,
                 vpRewardsByPlayer
             })
         };

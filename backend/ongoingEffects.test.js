@@ -402,6 +402,42 @@ test('Tortuga holds the winner’s minions for an optional post-scoring move', (
     assert.equal(scoringCompleted, true);
 });
 
+test('Tortuga offers its post-scoring move to every player tied for first', () => {
+    const firstWinner = createCard('dino_king_1', 'player-1');
+    const secondWinner = createCard('dino_king_1', 'player-2');
+    const room = createRoom([
+        createBase('base_tortuga', [firstWinner, secondWinner]),
+        createBase('base_jungle'),
+        createBase('base_the_homeworld')
+    ]);
+    room.baseDeck = [createBase('base_temple_of_lie')];
+    room.currentTurnPlayerId = 'player-1';
+
+    scoreBase(room, 0);
+
+    assert.deepEqual(room.players.map(player => player.vp), [4, 4]);
+    assert.deepEqual(
+        room.triggerQueue.map(trigger => trigger.playerId),
+        ['player-1', 'player-2']
+    );
+    assert.equal(processNextTriggeredAbility(room, 'ROOM'), true);
+    assert.equal(room.pendingAbility.playerId, 'player-1');
+    assert.equal(resolveTriggeredAbilityChoice(
+        room,
+        'ROOM',
+        { id: 'player-1' },
+        { choiceId: 'skip' }
+    ), true);
+    assert.equal(room.pendingAbility.playerId, 'player-2');
+    assert.equal(resolveTriggeredAbilityChoice(
+        room,
+        'ROOM',
+        { id: 'player-2' },
+        { choiceId: 'skip' }
+    ), true);
+    assert.deepEqual(room.players.map(player => player.discardPile.length), [1, 1]);
+});
+
 test('before-scoring Specials are queued in player order starting with the active player', () => {
     const room = createRoom([createBase('base_the_homeworld')]);
     room.players.push({ id: 'player-3', name: 'Three', hand: [], deck: [], discardPile: [], vp: 0 });

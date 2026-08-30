@@ -24,6 +24,9 @@ python3 -m pip install -r python/requirements.txt
 
 - `reset(...)`: creates or resets an environment and returns its first observation and `legalActions`.
 - `step(action_index)`: returns the next observation, legal actions, reward, termination flags, and transition metadata.
+- `choose_builtin_action(policy_version)`: asks one of Node's seeded built-in bot
+  policies to select a valid index for the current decision. The evaluation runner
+  uses this for opponent seats.
 - `result()`: returns the episode summary.
 - `save_trajectory()`: saves a completed recorded episode under
   `training-data/trajectories/`.
@@ -125,11 +128,75 @@ reward = transition["reward"]
 ```
 
 Each item deliberately retains the raw variable-length observation and legal
-action list. Tensor encoding, action padding, and action masks belong in a custom
-batch collator, which can apply the shared observation and action encoders after
-samples are selected. By default both native and migrated event histories are
-accepted. Restrict training to native structured histories with
+action list. The custom collator assembles samples, scalar tensors, and an action
+mask; trainable encoding and action-vector padding happen afterward inside the
+training step. By default both native and migrated event histories are accepted.
+Restrict training to native structured histories with
 `event_history_sources=["native-v1"]`.
+
+`collate_trajectory_batch` groups transitions for a PyTorch `DataLoader`. It
+leaves raw observations and actions unencoded, tensorizes rewards, targets, and
+terminal flags, and creates an action mask from each transition's number of legal
+actions:
+
+```python
+from torch.utils.data import DataLoader
+from trajectory_batch import collate_trajectory_batch
+
+loader = DataLoader(
+    dataset,
+    batch_size=32,
+    shuffle=True,
+    collate_fn=collate_trajectory_batch,
+)
+raw_batch = next(iter(loader))
+
+print(raw_batch["action_counts"].shape)  # [32]
+print(raw_batch["action_mask"].shape)    # [32, maximum actions in batch]
+```
+
+Run the trainable encoders inside the training step with
+`encode_trajectory_batch`. This pads encoded actions to
+`[batch, maximum_actions, 151]`, moves learning tensors to the encoder device,
+and preserves gradient flow into the shared embedding tables:
+
+```python
+from trajectory_batch import encode_trajectory_batch
+
+batch = encode_trajectory_batch(
+    raw_batch,
+    observation_encoder=observation_encoder,
+    action_encoder=entity_embeddings,
+)
+
+state_vectors = batch["state_vectors"]
+action_vectors = batch["action_vectors"]
+action_mask = batch["action_mask"]
+target_indices = batch["chosen_action_indices"]
+```
+
+Before selecting an action or calculating cross-entropy, mask padded action
+scores so they cannot be selected:
+
+```python
+masked_scores = action_scores.masked_fill(~action_mask, float("-inf"))
+```
+
+## Rewards
+
+Trajectory reward schema v2 keeps the match result on a similar scale to all VP
+earned during the game:
+
+```text
+vpReward       = changeInVictoryPoints / 15
+terminalReward = +1 for a winner, -1 for a loser, 0 otherwise
+reward         = vpReward + terminalReward
+```
+
+For example, gaining 3 VP produces `0.2`, while gaining 3 VP and winning produces
+`1.2`. A decision-limit truncation has no terminal reward. Each trajectory records
+`rewardSchemaVersion`, `victoryPointRewardScale`, `winReward`, and `lossReward` in
+its metadata, and `TrajectoryDataset` rejects incompatible reward definitions.
 
 ## Migrating older trajectories
 
@@ -143,9 +210,10 @@ file with:
 ```
 
 The command refuses to replace an existing destination unless `--force` is
-provided. The migration preserves observations, actions, rewards, and metadata,
-updates their schema versions, and reconstructs ordered decision events from each
-chosen action. Since old battle-log prose cannot reliably reconstruct every
+provided. The migration preserves observations, actions, and metadata, normalizes
+legacy VP rewards, updates their schema versions, and reconstructs ordered decision
+events from each chosen action. It can also upgrade a pre-normalization v5
+trajectory to reward schema v2. Since old battle-log prose cannot reliably reconstruct every
 automatic result, migrated files are marked with
 `eventHistorySource: "decision-backfill-v1"` and
 `automaticOutcomeEventsReconstructed: false`. Newly recorded trajectories are
@@ -153,3 +221,134 @@ marked `eventHistorySource: "native-v1"`, allowing a training pipeline to filter
 or weight the two sources differently.
 
 The local server binds to `127.0.0.1:3001` by default. Override it with `HEADLESS_ENV_HOST` and `HEADLESS_ENV_PORT`. Do not expose this development API publicly without authentication, rate limiting, and environment lifecycle limits.
+
+## Training the REINFORCE baseline
+
+`reinforce.py` contains the first trainable policy baseline. It uses the shared
+observation and legal-action encoders, assigns a logit to every action Node says
+is legal, and samples only from that variable-size list. After each group of
+complete games, it calculates Monte Carlo returns separately along each player's
+decision sequence and performs one on-policy REINFORCE update.
+
+Rewards are accumulated until the same player makes another decision. This is
+important because a player can gain VP while another player ends a turn or
+resolves scoring. Truncated games are reported but excluded from training because
+they do not contain complete Monte Carlo returns.
+
+Start the Node environment server from `backend/`:
+
+```bash
+npm run env-server
+```
+
+Then start a short training run from the repository root:
+
+```bash
+.venv/bin/python python/reinforce.py \
+  --episodes 20 \
+  --episodes-per-update 4 \
+  --seed 380
+```
+
+The default checkpoint is written to
+`training-data/checkpoints/reinforce.pt`, which is ignored by Git. Each checkpoint
+contains the policy, optimizer, entity schema version, training configuration,
+and completed episode/update counts. The saved JSON trajectories are useful for
+inspection and behavior cloning, but REINFORCE training collects fresh games from
+the current policy instead of repeatedly training on old heuristic trajectories.
+
+By default, training also checkpoints after every 10 successfully completed
+games. At each boundary, it atomically refreshes `reinforce.pt` and retains a
+numbered milestone beside it:
+
+```text
+reinforce.pt
+reinforce-episodes-000010.pt
+reinforce-episodes-000020.pt
+reinforce-episodes-000030.pt
+```
+
+Truncated games do not advance this counter. If a checkpoint boundary falls in
+the middle of the normal update batch, the pending games are trained first so the
+saved episode count always describes weights that have learned from those games.
+Change the interval with `--checkpoint-every`; use `--checkpoint-every 0` to
+disable milestone checkpoints. Resumed training continues from the cumulative
+completed-game count, so a checkpoint at episode 20 next saves a milestone at 30.
+
+Resume training from the model and Adam optimizer state in that checkpoint:
+
+```bash
+.venv/bin/python python/reinforce.py \
+  --resume training-data/checkpoints/reinforce.pt \
+  --episodes 20 \
+  --episodes-per-update 4 \
+  --seed 380
+```
+
+`--episodes` means additional completed-game attempts when resuming. Unless a
+different `--checkpoint` is supplied, the resumed checkpoint is updated in place.
+The seed offset continues after the checkpoint's completed episode count.
+
+Evaluate a checkpoint against the built-in opponents after starting the same Node
+environment server:
+
+```bash
+.venv/bin/python python/evaluate_reinforce.py \
+  --checkpoint training-data/checkpoints/reinforce.pt \
+  --player-count 3 \
+  --games-per-seat 5 \
+  --opponents random-v1 first-legal-v1 greedy_heuristic_1 greedy_heuristic_2 \
+  --seed 10000 \
+  --output training-data/evaluations/reinforce.json
+```
+
+For each opponent type and seed, the runner rotates the checkpoint through every
+seat. Every other seat uses the selected opponent policy. It reports overall,
+per-opponent, and per-seat win rate, average rank, VP, decision count, and
+truncations. Learned actions use deterministic argmax selection by default; add
+`--sample-actions` to evaluate the stochastic policy instead. Evaluation JSON is
+ignored by Git.
+
+## Bash training commands
+
+The repository includes executable wrappers that resolve the project and virtual
+environment paths even when invoked from another working directory:
+
+```bash
+./scripts/train.sh
+./scripts/resume_training.sh
+./scripts/evaluate_training.sh
+```
+
+They use the documented defaults while forwarding additional arguments to the
+underlying Python command. Arguments at the end override the wrapper defaults:
+
+```bash
+./scripts/train.sh --episodes 100 --player-count 2
+./scripts/resume_training.sh --episodes 50 --learning-rate 0.0001
+./scripts/evaluate_training.sh --games-per-seat 20 --sample-actions
+```
+
+Common settings can also be supplied through environment variables:
+
+```text
+PYTHON_BIN
+SMASHUP_BASE_URL
+SMASHUP_CHECKPOINT
+SMASHUP_EPISODES
+SMASHUP_EPISODES_PER_UPDATE
+SMASHUP_CHECKPOINT_EVERY
+SMASHUP_PLAYER_COUNT
+SMASHUP_SEED
+SMASHUP_GAMES_PER_SEAT
+SMASHUP_EVALUATION_SEED
+SMASHUP_EVALUATION_OUTPUT
+```
+
+The Node environment server must already be running. The wrappers can be detached
+with `nohup` in the same way as the direct Python commands:
+
+```bash
+mkdir -p training-data/logs
+nohup ./scripts/train.sh > training-data/logs/train.log 2>&1 &
+```

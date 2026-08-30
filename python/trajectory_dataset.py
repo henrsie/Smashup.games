@@ -19,6 +19,10 @@ DEFAULT_TRAJECTORY_DIRECTORY = (
 TRAJECTORY_SCHEMA_VERSION = 5
 OBSERVATION_SCHEMA_VERSION = 5
 EVENT_SCHEMA_VERSION = 1
+REWARD_SCHEMA_VERSION = 2
+VICTORY_POINT_REWARD_SCALE = 1.0 / 15.0
+WIN_REWARD = 1.0
+LOSS_REWARD = -1.0
 SUPPORTED_EVENT_HISTORY_SOURCES = frozenset({
     "native-v1",
     "decision-backfill-v1",
@@ -399,6 +403,21 @@ class _TrajectoryValidator:
                     f"{json_path}.{reward_field}",
                     "must be a finite number",
                 )
+        if not math.isclose(
+            float(entry["reward"]),
+            float(entry["vpReward"]) + float(entry["terminalReward"]),
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        ):
+            self.fail(
+                f"{json_path}.reward",
+                "must equal vpReward + terminalReward",
+            )
+        if entry["terminalReward"] not in (LOSS_REWARD, 0, WIN_REWARD):
+            self.fail(
+                f"{json_path}.terminalReward",
+                "must be -1, 0, or 1",
+            )
         for flag in ("terminated", "truncated", "done"):
             if not isinstance(entry.get(flag), bool):
                 self.fail(f"{json_path}.{flag}", "must be a boolean")
@@ -439,6 +458,28 @@ class _TrajectoryValidator:
             EVENT_SCHEMA_VERSION,
             "$.metadata.eventSchemaVersion",
         )
+        self.require_version(
+            metadata.get("rewardSchemaVersion"),
+            REWARD_SCHEMA_VERSION,
+            "$.metadata.rewardSchemaVersion",
+        )
+        expected_reward_metadata = {
+            "victoryPointRewardScale": VICTORY_POINT_REWARD_SCALE,
+            "winReward": WIN_REWARD,
+            "lossReward": LOSS_REWARD,
+        }
+        for field, expected_value in expected_reward_metadata.items():
+            value = metadata.get(field)
+            if not _is_finite_number(value) or not math.isclose(
+                float(value),
+                expected_value,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            ):
+                self.fail(
+                    f"$.metadata.{field}",
+                    f"must equal {expected_value}",
+                )
         event_history_source = metadata.get("eventHistorySource")
         if event_history_source not in self.allowed_event_history_sources:
             self.fail(

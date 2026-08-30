@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Optional, Union
+from typing import Any, Optional, Sequence, Union
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -67,6 +67,7 @@ class NodeSmashUpEnv:
         player_count: int = 3,
         max_decisions: int = 10_000,
         record_trajectory: bool = False,
+        policy_versions: Optional[Sequence[str]] = None,
     ) -> dict[str, Any]:
         payload = {
             "randomSeed": seed,
@@ -75,6 +76,8 @@ class NodeSmashUpEnv:
             "recordTrajectory": record_trajectory,
             "policyVersion": "external-python-v1",
         }
+        if policy_versions is not None:
+            payload["policyVersions"] = list(policy_versions)
         if self.environment_id is None:
             state = self._request("POST", "/environments", payload) or {}
             self.environment_id = state.get("environmentId")
@@ -87,6 +90,22 @@ class NodeSmashUpEnv:
         if not self.environment_id:
             raise NodeEnvironmentError("Node did not return an environment ID.")
         return state
+
+    def choose_builtin_action(self, policy_version: str) -> int:
+        """Ask Node's seeded built-in policy to select from the current legal actions."""
+        if self.environment_id is None:
+            raise NodeEnvironmentError("Call reset() before choosing an opponent action.")
+        if not isinstance(policy_version, str) or not policy_version:
+            raise TypeError("policy_version must be a non-empty string.")
+        selection = self._request(
+            "POST",
+            f"/environments/{self.environment_id}/built-in-policy-action",
+            {"policyVersion": policy_version},
+        ) or {}
+        action_index = selection.get("actionIndex")
+        if isinstance(action_index, bool) or not isinstance(action_index, int):
+            raise NodeEnvironmentError("Node did not return a valid built-in action index.")
+        return action_index
 
     def step(self, action_index: int) -> dict[str, Any]:
         if self.environment_id is None:

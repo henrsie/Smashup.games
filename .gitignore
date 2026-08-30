@@ -9,6 +9,9 @@ dist/
 coverage/
 .vite/
 training-data/trajectories/*.json
+training-data/checkpoints/
+training-data/evaluations/
+python/*.ipynb
 
 # Environment files
 .env

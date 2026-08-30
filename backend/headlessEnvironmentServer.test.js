@@ -126,3 +126,26 @@ test('Python bridge manager accepts per-player policy versions', () => {
         policyVersions
     );
 });
+
+test('Python bridge can request a validated action from a built-in opponent policy', () => {
+    const manager = createHeadlessEnvironmentManager({ idFactory: () => 'opponent-environment' });
+    const created = manager.create({
+        playerCount: 2,
+        randomSeed: 322,
+        recordTrajectory: false
+    });
+    const environment = manager.get(created.environmentId);
+
+    const selection = environment.chooseBuiltInPolicyAction(
+        BOT_POLICY_VERSIONS.GREEDY_HEURISTIC_1
+    );
+
+    assert.equal(selection.actorId, created.state.observation.observerPlayerId);
+    assert.equal(selection.policyVersion, BOT_POLICY_VERSIONS.GREEDY_HEURISTIC_1);
+    assert.ok(selection.actionIndex >= 0);
+    assert.ok(selection.actionIndex < created.state.legalActions.length);
+    assert.throws(
+        () => environment.chooseBuiltInPolicyAction('external-python-v1'),
+        /Unsupported built-in bot policy/
+    );
+});

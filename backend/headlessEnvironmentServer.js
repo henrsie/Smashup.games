@@ -10,7 +10,7 @@ const {
 
 const DEFAULT_ENVIRONMENT_PORT = 3001;
 const DEFAULT_ENVIRONMENT_HOST = '127.0.0.1';
-const HEADLESS_PROTOCOL_VERSION = 2;
+const HEADLESS_PROTOCOL_VERSION = 3;
 const EXTERNAL_PYTHON_POLICY_VERSION = 'external-python-v1';
 const DEFAULT_TRAJECTORY_DIRECTORY = path.resolve(
     __dirname,
@@ -222,6 +222,23 @@ function createHeadlessEnvironmentApp({
                 environmentId: request.params.environmentId,
                 ...transition
             });
+        } catch (error) {
+            return next(error);
+        }
+    });
+
+    app.post('/environments/:environmentId/built-in-policy-action', (request, response, next) => {
+        try {
+            const environment = manager.get(request.params.environmentId);
+            if (!environment) {
+                return response.status(404).json({
+                    code: 'environment_not_found',
+                    error: 'Headless environment not found.'
+                });
+            }
+            return response.status(200).json(
+                environment.chooseBuiltInPolicyAction(request.body?.policyVersion)
+            );
         } catch (error) {
             return next(error);
         }

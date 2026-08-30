@@ -94,6 +94,11 @@ def old_trajectory() -> dict:
 class TrajectoryMigrationTests(unittest.TestCase):
     def test_v4_trajectory_is_backfilled_without_mutating_source(self) -> None:
         source = old_trajectory()
+        source["entries"][0].update({
+            "vpReward": 3,
+            "terminalReward": 0,
+            "reward": 3,
+        })
         original = copy.deepcopy(source)
 
         migrated = migrate_trajectory(source)
@@ -104,6 +109,10 @@ class TrajectoryMigrationTests(unittest.TestCase):
         self.assertEqual(migrated["metadata"]["observationSchemaVersion"], 5)
         self.assertEqual(migrated["metadata"]["entityIdSchemaVersion"], 4)
         self.assertEqual(migrated["metadata"]["eventSchemaVersion"], 1)
+        self.assertEqual(migrated["metadata"]["rewardSchemaVersion"], 2)
+        self.assertEqual(migrated["metadata"]["victoryPointRewardScale"], 1 / 15)
+        self.assertEqual(migrated["entries"][0]["vpReward"], 3 / 15)
+        self.assertEqual(migrated["entries"][0]["reward"], 3 / 15)
         self.assertEqual(
             migrated["metadata"]["eventHistorySource"],
             "decision-backfill-v1",
@@ -144,6 +153,10 @@ class TrajectoryMigrationTests(unittest.TestCase):
             "entityIdSchemaVersion": 4,
             "eventSchemaVersion": 1,
             "eventHistorySource": "native-v1",
+            "rewardSchemaVersion": 2,
+            "victoryPointRewardScale": 1 / 15,
+            "winReward": 1,
+            "lossReward": -1,
         })
 
         self.assertEqual(migrate_trajectory(current), current)
@@ -162,6 +175,7 @@ class TrajectoryMigrationTests(unittest.TestCase):
         migrated = migrate_trajectory(current)
 
         self.assertEqual(migrated["metadata"]["entityIdSchemaVersion"], 4)
+        self.assertEqual(migrated["metadata"]["rewardSchemaVersion"], 2)
         self.assertEqual(
             migrated["metadata"]["actionEncodingSource"],
             "choice-features-backfill-v1",
@@ -169,6 +183,30 @@ class TrajectoryMigrationTests(unittest.TestCase):
         chosen_action = migrated["entries"][1]["chosenAction"]
         self.assertEqual(chosen_action["choiceTypeId"], 3)
         self.assertIn("targetCardPosition", chosen_action["choiceFeatures"])
+
+    def test_v5_legacy_rewards_are_normalized_without_reencoding_entities(self) -> None:
+        current = old_trajectory()
+        current["schemaVersion"] = 5
+        current["metadata"].update({
+            "trajectorySchemaVersion": 5,
+            "observationSchemaVersion": 5,
+            "entityIdSchemaVersion": 4,
+            "eventSchemaVersion": 1,
+            "eventHistorySource": "native-v1",
+        })
+        current["entries"][0].update({
+            "vpReward": 3,
+            "terminalReward": 1,
+            "reward": 4,
+        })
+
+        migrated = migrate_trajectory(current)
+
+        self.assertEqual(migrated["metadata"]["rewardSchemaVersion"], 2)
+        self.assertEqual(migrated["entries"][0]["vpReward"], 3 / 15)
+        self.assertEqual(migrated["entries"][0]["terminalReward"], 1)
+        self.assertEqual(migrated["entries"][0]["reward"], (3 / 15) + 1)
+        self.assertNotIn("actionEncodingSource", migrated["metadata"])
 
     def test_unsupported_older_schema_is_rejected(self) -> None:
         unsupported = old_trajectory()

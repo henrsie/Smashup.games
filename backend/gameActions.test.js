@@ -580,9 +580,9 @@ test('finishing a game applies win and loss rewards to pending trajectories', ()
 
     assert.equal(result.winnerId, 'bot-1');
     assert.equal(stoppedRoomId, 'ROOM1');
-    assert.equal(winnerEntry.vpReward, 1);
+    assert.equal(winnerEntry.vpReward, 1 / 15);
     assert.equal(winnerEntry.terminalReward, 1);
-    assert.equal(winnerEntry.reward, 2);
+    assert.equal(winnerEntry.reward, 1 + (1 / 15));
     assert.equal(winnerEntry.terminated, true);
     assert.equal(loserEntry.vpReward, 0);
     assert.equal(loserEntry.terminalReward, -1);
@@ -787,6 +787,70 @@ test('base discard reshuffles are reproducible from the room seed', () => {
         new Set([...first.activeBaseIds, ...first.baseDeckIds]),
         new Set(['scored-base', 'discarded-base-1', 'discarded-base-2'])
     );
+});
+
+test('base scoring uses competition ranking when players tie', async t => {
+    const scorePlayers = powers => {
+        const room = createRoom('player-1');
+        room.players = powers.map((power, index) => ({
+            id: `player-${index + 1}`,
+            name: `Player ${index + 1}`,
+            hand: [],
+            deck: [],
+            discardPile: [],
+            vp: 0
+        }));
+        room.activeBases[0] = {
+            id: 'tie-base',
+            name: 'Tie Base',
+            breakpoint: 1,
+            vp: [5, 3, 1],
+            abilities: [],
+            playedCards: powers.map((power, index) => {
+                const minion = createCard(
+                    'dino_king_1',
+                    `player-${index + 1}`,
+                    `tie-minion-${index + 1}`
+                );
+                minion.printedPower = power;
+                minion.power = power;
+                return minion;
+            })
+        };
+
+        scoreBase(room, 0);
+
+        const places = Object.fromEntries(
+            room.structuredEvents
+                .filter(event => event.eventType === 'victory-points-awarded')
+                .map(event => [event.actorPlayerId, event.count])
+        );
+        return {
+            victoryPoints: room.players.map(player => player.vp),
+            places: room.players.map(player => places[player.id])
+        };
+    };
+
+    await t.test('two players tied for first leave third place next', () => {
+        assert.deepEqual(scorePlayers([5, 5, 3]), {
+            victoryPoints: [5, 5, 1],
+            places: [1, 1, 3]
+        });
+    });
+
+    await t.test('three players tied for first all receive first-place VP', () => {
+        assert.deepEqual(scorePlayers([5, 5, 5]), {
+            victoryPoints: [5, 5, 5],
+            places: [1, 1, 1]
+        });
+    });
+
+    await t.test('two players tied for second both receive second-place VP', () => {
+        assert.deepEqual(scorePlayers([6, 4, 4]), {
+            victoryPoints: [5, 3, 3],
+            places: [1, 2, 2]
+        });
+    });
 });
 
 test('a bot-style actor completes its faction draft through the shared dispatcher', () => {
@@ -1411,6 +1475,10 @@ test('the trajectory links consecutive player decisions and records VP rewards',
     assert.equal(activeTrajectory.metadata.entityIdSchemaVersion, 4);
     assert.equal(activeTrajectory.metadata.eventSchemaVersion, 1);
     assert.equal(activeTrajectory.metadata.eventHistorySource, 'native-v1');
+    assert.equal(activeTrajectory.metadata.rewardSchemaVersion, 2);
+    assert.equal(activeTrajectory.metadata.victoryPointRewardScale, 1 / 15);
+    assert.equal(activeTrajectory.metadata.winReward, 1);
+    assert.equal(activeTrajectory.metadata.lossReward, -1);
     assert.equal(activeTrajectory.metadata.policyVersion, 'random-v1');
     assert.equal(activeTrajectory.metadata.randomSeed, 123456);
     assert.equal(activeTrajectory.metadata.randomAlgorithm, 'mulberry32-v1');
@@ -1423,7 +1491,7 @@ test('the trajectory links consecutive player decisions and records VP rewards',
     assert.equal(activeTrajectory.entries[0].decisionType, 'turnAction');
     assert.equal(activeTrajectory.entries[0].stepIndex, 0);
     assert.equal(activeTrajectory.entries[0].chosenActionIndex, 0);
-    assert.equal(activeTrajectory.entries[0].reward, 3);
+    assert.equal(activeTrajectory.entries[0].reward, 3 / 15);
     assert.equal(activeTrajectory.entries[0].nextObservation.players[0].vp, 3);
     assert.equal(activeTrajectory.entries[0].done, false);
     assert.equal(activeTrajectory.entries[1].reward, null);

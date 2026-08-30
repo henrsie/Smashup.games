@@ -53,10 +53,12 @@ const MAX_CONSECUTIVE_BOT_ACTIONS = 100;
 const DISCONNECT_GRACE_PERIOD_MS = 10_000;
 const TRAJECTORY_SCHEMA_VERSION = 5;
 const OBSERVATION_SCHEMA_VERSION = 5;
+const REWARD_SCHEMA_VERSION = 2;
 const DEFAULT_BOT_POLICY_VERSION = BOT_POLICY_VERSIONS.RANDOM;
 const WINNING_VICTORY_POINTS = 15;
 const WIN_REWARD = 1;
 const LOSS_REWARD = -1;
+const VICTORY_POINT_REWARD_SCALE = 1 / WINNING_VICTORY_POINTS;
 const createInitialTurnState = () => ({
     actionPlayed: false,
     minionPlayed: false,
@@ -1686,6 +1688,10 @@ function ensureRoomTrajectory(room, roomId) {
                 entityIdSchemaVersion: ENTITY_ID_SCHEMA_VERSION,
                 eventSchemaVersion: STRUCTURED_EVENT_SCHEMA_VERSION,
                 eventHistorySource: 'native-v1',
+                rewardSchemaVersion: REWARD_SCHEMA_VERSION,
+                victoryPointRewardScale: VICTORY_POINT_REWARD_SCALE,
+                winReward: WIN_REWARD,
+                lossReward: LOSS_REWARD,
                 gameId: roomId,
                 policyVersion: room.botPolicyVersion || DEFAULT_BOT_POLICY_VERSION,
                 randomSeed: room.randomSeed ?? null,
@@ -1737,6 +1743,10 @@ function getObservationVictoryPoints(observation, playerId) {
     return Number.isFinite(player?.vp) ? player.vp : 0;
 }
 
+function getNormalizedVictoryPointReward(beforeVictoryPoints, afterVictoryPoints) {
+    return (afterVictoryPoints - beforeVictoryPoints) * VICTORY_POINT_REWARD_SCALE;
+}
+
 function finalizePendingTrajectoryEntry(
     trajectory,
     playerId,
@@ -1748,8 +1758,10 @@ function finalizePendingTrajectoryEntry(
 
     const entry = trajectory.entries[entryIndex];
     entry.nextObservation = cloneObservationValue(nextObservation);
-    entry.vpReward = getObservationVictoryPoints(nextObservation, playerId)
-        - getObservationVictoryPoints(entry.observation, playerId);
+    entry.vpReward = getNormalizedVictoryPointReward(
+        getObservationVictoryPoints(entry.observation, playerId),
+        getObservationVictoryPoints(nextObservation, playerId)
+    );
     entry.terminalReward = Number(terminalRewards[playerId]) || 0;
     entry.reward = entry.vpReward + entry.terminalReward;
     entry.terminated = terminated;
@@ -1777,8 +1789,10 @@ function recordTrajectoryDecision({
             .find(entry => entry.playerId === playerId && entry.terminated);
         if (previousEntry) {
             previousEntry.nextObservation = cloneObservationValue(observation);
-            previousEntry.vpReward = getObservationVictoryPoints(observation, playerId)
-                - getObservationVictoryPoints(previousEntry.observation, playerId);
+            previousEntry.vpReward = getNormalizedVictoryPointReward(
+                getObservationVictoryPoints(previousEntry.observation, playerId),
+                getObservationVictoryPoints(observation, playerId)
+            );
             previousEntry.terminalReward = 0;
             previousEntry.reward = previousEntry.vpReward;
             previousEntry.terminated = false;
@@ -6297,14 +6311,25 @@ function scoreBase(room, baseIndex) {
     const rankedPlayers = Object.entries(powerPerPlayer)
         .filter(([id, power]) => power > 0)
         .sort((a, b) => b[1] - a[1]);
-
-    const winnerId = rankedPlayers[0]?.[0] || null;
+    // Competition ranking preserves skipped places after ties: 1, 1, 3 and 1, 2, 2.
+    let previousPower = null;
+    let placementIndex = 0;
+    const playerPlacements = rankedPlayers.map(([playerId, power], sortedIndex) => {
+        if (previousPower !== null && power !== previousPower) placementIndex = sortedIndex;
+        previousPower = power;
+        return { playerId, power, placementIndex };
+    });
+    const winnerIds = playerPlacements
+        .filter(placement => placement.placementIndex === 0)
+        .map(placement => placement.playerId);
+    const soleWinnerId = winnerIds.length === 1 ? winnerIds[0] : null;
+    const winnerIdSet = new Set(winnerIds);
     const baseWinnerMoveEffect = !baseAbilitiesAreCancelled(base)
         ? getTriggeredEffects(base, 'afterBaseScoring', 'moveMinion')
             .find(effect => effect.target?.owner === 'baseWinner' && effect.target.location === 'thisBase')
         : null;
-    const heldWinnerMinions = baseWinnerMoveEffect && winnerId
-        ? getBaseMinions(base).filter(minion => minion.ownerId === winnerId)
+    const heldWinnerMinions = baseWinnerMoveEffect && winnerIds.length > 0
+        ? getBaseMinions(base).filter(minion => winnerIdSet.has(minion.ownerId))
         : [];
     const specialAfterScoringMinions = getBaseMinions(base).filter(minion => (
         getTriggeredEffects(minion, 'afterBaseScoring').some(effect => (
@@ -6322,11 +6347,11 @@ function scoreBase(room, baseIndex) {
     const vpAwards = [];
 
     // Award VP based on base.vp array [1st place, 2nd place, 3rd place].
-    rankedPlayers.forEach(([playerId], rank) => {
-        if (base.vp[rank] !== undefined) {
+    playerPlacements.forEach(({ playerId, placementIndex: playerPlacementIndex }) => {
+        if (base.vp[playerPlacementIndex] !== undefined) {
             const targetPlayer = room.players.find(p => p.id === playerId);
             if (targetPlayer) {
-                const victoryPoints = base.vp[rank];
+                const victoryPoints = base.vp[playerPlacementIndex];
                 targetPlayer.vp += victoryPoints;
                 vpAwards.push(formatVictoryPointAward(targetPlayer.name, victoryPoints));
                 recordStructuredEvent(room, {
@@ -6334,7 +6359,7 @@ function scoreBase(room, baseIndex) {
                     actorPlayerId: targetPlayer.id,
                     base,
                     amount: victoryPoints,
-                    count: rank + 1
+                    count: playerPlacementIndex + 1
                 });
             }
         }
@@ -6382,7 +6407,7 @@ function scoreBase(room, baseIndex) {
     }
     recordStructuredEvent(room, {
         eventType: 'base-scored',
-        actorPlayerId: winnerId,
+        actorPlayerId: soleWinnerId,
         base,
         destinationBase: newBase,
         count: rankedPlayers.length
@@ -6412,15 +6437,19 @@ function scoreBase(room, baseIndex) {
             });
         }
     });
-    if (heldWinnerMinions.length > 0) {
-        triggersByPlayer.get(winnerId)?.push({
-            type: 'baseWinnerMoveAfterScoring',
-            playerId: winnerId,
-            candidateMinions: heldWinnerMinions,
-            destinationBaseIds,
-            sourceBaseName: base.name
-        });
-    }
+    winnerIds.forEach(winnerId => {
+        const candidateMinions = heldWinnerMinions
+            .filter(minion => minion.ownerId === winnerId);
+        if (candidateMinions.length > 0) {
+            triggersByPlayer.get(winnerId)?.push({
+                type: 'baseWinnerMoveAfterScoring',
+                playerId: winnerId,
+                candidateMinions,
+                destinationBaseIds,
+                sourceBaseName: base.name
+            });
+        }
+    });
     getPlayersInTurnOrder(room).forEach(player => {
         room.triggerQueue.push(...(triggersByPlayer.get(player.id) || []));
     });
@@ -6560,6 +6589,7 @@ module.exports = {
     getLegalActionEncodingKey,
     getLegalActions,
     getBotDecisionActorId,
+    getNormalizedVictoryPointReward,
     getPlayerObservation,
     getRecentStructuredEvents,
     getRoomTrajectory,
