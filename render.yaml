@@ -1,5 +1,11 @@
 services:
   - type: web
     name: smashup.games
-    env: docker          
-    plan: free          
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    envVars:
+      - key: CLIENT_ORIGIN
+        sync: false

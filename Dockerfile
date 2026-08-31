@@ -13,12 +13,15 @@ RUN apt-get update \
     && apt-get install --yes --no-install-recommends ca-certificates python3 python3-venv \
     && rm -rf /var/lib/apt/lists/*
 
-RUN python3 -m venv /opt/smashup-python \
-    && /opt/smashup-python/bin/pip install --no-cache-dir numpy==2.0.2 \
-    && /opt/smashup-python/bin/pip install \
-        --no-cache-dir \
-        --index-url https://download.pytorch.org/whl/cpu \
-        torch==2.8.0
+RUN python3 -m venv /opt/smashup-python
+RUN /opt/smashup-python/bin/pip install --no-cache-dir --upgrade pip setuptools wheel
+RUN /opt/smashup-python/bin/pip install \
+    --no-cache-dir \
+    --index-url https://download.pytorch.org/whl/cpu \
+    torch==2.8.0+cpu
+RUN /opt/smashup-python/bin/pip install --no-cache-dir numpy==2.0.2
+RUN /opt/smashup-python/bin/python -c \
+    "import numpy, torch; print(f'NumPy {numpy.__version__}; PyTorch {torch.__version__}')"
 
 WORKDIR /app
 
