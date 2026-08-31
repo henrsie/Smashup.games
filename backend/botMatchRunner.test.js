@@ -6,6 +6,7 @@ const {
     validateBotMatchRequest
 } = require('./botMatchRunner.js');
 const { BOT_POLICY_VERSIONS } = require('./botPolicies.js');
+const { RL_BOT_POLICY_VERSIONS } = require('./rlBotPolicy.js');
 
 const MIXED_POLICIES = [
     BOT_POLICY_VERSIONS.RANDOM,
@@ -29,6 +30,28 @@ test('bot-match requests require two or three supported strategies', () => {
     assert.doesNotThrow(() => validateBotMatchRequest({
         policyVersions: [BOT_POLICY_VERSIONS.GREEDY_HEURISTIC_1, BOT_POLICY_VERSIONS.GREEDY_HEURISTIC_1]
     }));
+});
+
+test('bot-match validation exposes RL policies only when the runtime is available', () => {
+    const lineup = [
+        RL_BOT_POLICY_VERSIONS.DETERMINISTIC,
+        BOT_POLICY_VERSIONS.RANDOM
+    ];
+
+    assert.throws(
+        () => validateBotMatchRequest(
+            { policyVersions: lineup },
+            { availablePolicyVersions: [BOT_POLICY_VERSIONS.RANDOM] }
+        ),
+        /not supported/
+    );
+    assert.deepEqual(
+        validateBotMatchRequest(
+            { policyVersions: lineup },
+            { availablePolicyVersions: lineup }
+        ).policyVersions,
+        lineup
+    );
 });
 
 test('bot-match worker returns a compact result for mixed strategies', async () => {

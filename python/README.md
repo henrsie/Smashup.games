@@ -235,6 +235,25 @@ important because a player can gain VP while another player ends a turn or
 resolves scoring. Truncated games are reported but excluded from training because
 they do not contain complete Monte Carlo returns.
 
+By default, half of the episodes use full self-play and half use a mixed lineup:
+one seat uses the learned policy while every other seat independently samples
+`random-v1`, `greedy_heuristic_1`, or `greedy_heuristic_2`. The learned seat
+rotates by episode. Heuristic turns are executed and validated by Node, but only
+actions sampled by the learned policy enter the REINFORCE update. Use a different
+mixture or return to pure self-play with:
+
+```bash
+./scripts/train.sh --heuristic-game-probability 0.7
+./scripts/train.sh --heuristic-game-probability 0
+./scripts/train.sh \
+  --heuristic-game-probability 1 \
+  --opponent-policies random-v1 greedy_heuristic_2
+```
+
+Each completed rollout logs its complete lineup, learned player IDs, total game
+decisions, and number of trainable policy transitions. Repeating an opponent in
+`--opponent-policies` gives it additional sampling weight.
+
 Start the Node environment server from `backend/`:
 
 ```bash
@@ -288,6 +307,32 @@ Resume training from the model and Adam optimizer state in that checkpoint:
 `--episodes` means additional completed-game attempts when resuming. Unless a
 different `--checkpoint` is supplied, the resumed checkpoint is updated in place.
 The seed offset continues after the checkpoint's completed episode count.
+
+### Checkpoint policies in Bot Mode and live rooms
+
+When the backend can find both `.venv/bin/python` and
+`training-data/checkpoints/reinforce.pt`, frontend Bot Mode and the host's lobby
+bot selector add two strategies:
+
+- `rl_v1_deterministic` chooses the legal action with the highest checkpoint
+  logit.
+- `rl_v1_stochastic` samples from the checkpoint's legal-action distribution
+  using the match seed.
+
+The options are omitted when the checkpoint or Python runtime is unavailable.
+Each simulated match or live room starts one persistent Python inference worker,
+loads the checkpoint once, and sends action indexes back to the authoritative Node
+game. Multiple RL bots in one room share that inference worker. It is closed when
+the game finishes, the room is destroyed, or the backend shuts down. Override the
+defaults when the backend runs from another environment with:
+
+```text
+SMASHUP_RL_CHECKPOINT=/absolute/path/to/reinforce.pt
+SMASHUP_PYTHON_BIN=/absolute/path/to/python
+```
+
+The active `reinforce.pt` file is saved through atomic replacement, so Bot Mode
+can safely load the last complete checkpoint while another process is training.
 
 Evaluate a checkpoint against the built-in opponents after starting the same Node
 environment server:
@@ -378,6 +423,7 @@ SMASHUP_CHECKPOINT
 SMASHUP_EPISODES
 SMASHUP_EPISODES_PER_UPDATE
 SMASHUP_CHECKPOINT_EVERY
+SMASHUP_HEURISTIC_GAME_PROBABILITY
 SMASHUP_PLAYER_COUNT
 SMASHUP_SEED
 SMASHUP_GAMES_PER_SEAT

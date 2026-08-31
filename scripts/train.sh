@@ -21,4 +21,6 @@ exec "${python_bin}" "${project_root}/python/reinforce.py" \
     --checkpoint-every "${SMASHUP_CHECKPOINT_EVERY:-10}" \
     --player-count "${SMASHUP_PLAYER_COUNT:-3}" \
     --seed "${SMASHUP_SEED:-380}" \
+    --heuristic-game-probability "${SMASHUP_HEURISTIC_GAME_PROBABILITY:-0.5}" \
+    --opponent-policies random-v1 greedy_heuristic_1 greedy_heuristic_2 \
     "$@"

@@ -15,18 +15,25 @@ const DEFAULT_TURN_STATE = {
   talentUses: {}
 };
 const MINION_TARGETING_MODES = ['ally-minion', 'enemy-minion', 'neutral-minion'];
-const BOT_POLICY_OPTIONS = [
+const LOBBY_BOT_POLICY_OPTIONS = [
   { value: 'first-legal-v1', label: 'First legal action' },
   { value: 'random-v1', label: 'Random' },
   { value: 'greedy_heuristic_1', label: 'Greedy heuristic 1' },
   { value: 'greedy_heuristic_2', label: 'Greedy heuristic 2' }
 ];
-const BOT_POLICY_LABELS = Object.fromEntries(BOT_POLICY_OPTIONS.map(option => [option.value, option.label]));
+const RL_BOT_POLICY_OPTIONS = [
+  { value: 'rl_v1_deterministic', label: 'RL v1 deterministic' },
+  { value: 'rl_v1_stochastic', label: 'RL v1 stochastic' }
+];
+const ALL_BOT_POLICY_OPTIONS = [...LOBBY_BOT_POLICY_OPTIONS, ...RL_BOT_POLICY_OPTIONS];
+const BOT_POLICY_LABELS = Object.fromEntries(ALL_BOT_POLICY_OPTIONS.map(option => [option.value, option.label]));
 const BOT_POLICY_DESCRIPTIONS = {
   'first-legal-v1': 'Always chooses the first legal gameplay action.',
   'random-v1': 'Chooses randomly from every legal action.',
   greedy_heuristic_1: 'Plays stronger minions toward the bases with the most power.',
-  greedy_heuristic_2: 'Plays stronger minions toward the bases with the least power.'
+  greedy_heuristic_2: 'Plays stronger minions toward the bases with the least power.',
+  rl_v1_deterministic: 'Loads the trained checkpoint and always chooses its highest-scoring legal action.',
+  rl_v1_stochastic: 'Loads the trained checkpoint and samples from its legal-action probabilities.'
 };
 const DEFAULT_BOT_MODE_POLICIES = ['random-v1', 'greedy_heuristic_1'];
 const getPlayerDisplayName = player => (
@@ -258,6 +265,7 @@ function BotModeSetup({
   botCount,
   error,
   isRunning,
+  policyOptions,
   policyVersions,
   onBack,
   onBotCountChange,
@@ -370,7 +378,7 @@ function BotModeSetup({
                     width: '100%'
                   }}
                 >
-                  {BOT_POLICY_OPTIONS.map(option => (
+                  {policyOptions.map(option => (
                     <option key={option.value} value={option.value}>
                       {option.label}
                     </option>
@@ -612,6 +620,9 @@ function App() {
   const [chatDraft, setChatDraft] = useState('');
   const [selectedBotPolicy, setSelectedBotPolicy] = useState('greedy_heuristic_1');
   const [showBotModeSetup, setShowBotModeSetup] = useState(false);
+  const [availableBotModePolicyVersions, setAvailableBotModePolicyVersions] = useState(
+    LOBBY_BOT_POLICY_OPTIONS.map(option => option.value)
+  );
   const [botModePolicyVersions, setBotModePolicyVersions] = useState(DEFAULT_BOT_MODE_POLICIES);
   const [botModeRunning, setBotModeRunning] = useState(false);
   const [botModeResult, setBotModeResult] = useState(null);
@@ -759,6 +770,25 @@ function App() {
       setBotModeError(error || 'The bot match could not be completed.');
     });
 
+    socket.on('bot-match-policy-options', ({ policyVersions } = {}) => {
+      const knownPolicyVersions = new Set(ALL_BOT_POLICY_OPTIONS.map(option => option.value));
+      const availablePolicyVersions = Array.isArray(policyVersions)
+        ? policyVersions.filter(policyVersion => knownPolicyVersions.has(policyVersion))
+        : LOBBY_BOT_POLICY_OPTIONS.map(option => option.value);
+      const fallbackPolicyVersion = availablePolicyVersions[0] || 'random-v1';
+      setAvailableBotModePolicyVersions(availablePolicyVersions);
+      setSelectedBotPolicy(currentPolicy => (
+        availablePolicyVersions.includes(currentPolicy)
+          ? currentPolicy
+          : fallbackPolicyVersion
+      ));
+      setBotModePolicyVersions(currentPolicies => currentPolicies.map(policyVersion => (
+        availablePolicyVersions.includes(policyVersion)
+          ? policyVersion
+          : fallbackPolicyVersion
+      )));
+    });
+
     const handleSocketDisconnect = () => {
       setBotModeRunning(wasRunning => {
         if (wasRunning) setBotModeError('The server connection was lost while the bots were playing.');
@@ -777,6 +807,7 @@ function App() {
     socket.on('error', (errMessage) => {
       alert(errMessage);
     });
+    socket.emit('get-bot-match-policy-options');
 
     return () => {
       socket.off('room-created');
@@ -792,6 +823,7 @@ function App() {
       socket.off('chat-message');
       socket.off('bot-match-completed');
       socket.off('bot-match-failed');
+      socket.off('bot-match-policy-options');
       socket.off('disconnect', handleSocketDisconnect);
       socket.off('room-reset');
       socket.off('error');
@@ -858,10 +890,14 @@ function App() {
   };
 
   const handleBotModeCountChange = (botCount) => {
+    const policyOptions = ALL_BOT_POLICY_OPTIONS.filter(option => (
+      availableBotModePolicyVersions.includes(option.value)
+    ));
     setBotModePolicyVersions(currentPolicies => {
       const nextPolicies = currentPolicies.slice(0, botCount);
       while (nextPolicies.length < botCount) {
-        const availablePolicy = BOT_POLICY_OPTIONS.find(option => !nextPolicies.includes(option.value));
+        const availablePolicy = policyOptions.find(option => !nextPolicies.includes(option.value))
+          || policyOptions[0];
         nextPolicies.push(availablePolicy.value);
       }
       return nextPolicies;
@@ -946,6 +982,9 @@ function App() {
   };
 
   if (!currentRoom && showBotModeSetup) {
+    const policyOptions = ALL_BOT_POLICY_OPTIONS.filter(option => (
+      availableBotModePolicyVersions.includes(option.value)
+    ));
     if (botModeResult) {
       return (
         <BotModeResult
@@ -961,6 +1000,7 @@ function App() {
         botCount={botModePolicyVersions.length}
         error={botModeError}
         isRunning={botModeRunning}
+        policyOptions={policyOptions}
         policyVersions={botModePolicyVersions}
         onBack={handleCloseBotMode}
         onBotCountChange={handleBotModeCountChange}
@@ -2269,6 +2309,7 @@ function App() {
                 setBotModeResult(null);
                 setBotModeError('');
                 setShowBotModeSetup(true);
+                socket.emit('get-bot-match-policy-options');
               }}
               style={{
                 background: '#243b53',
@@ -2343,9 +2384,11 @@ function App() {
                     onChange={(event) => setSelectedBotPolicy(event.target.value)}
                     style={{ marginRight: '8px', padding: '9px' }}
                   >
-                    {BOT_POLICY_OPTIONS.map(option => (
+                    {ALL_BOT_POLICY_OPTIONS
+                      .filter(option => availableBotModePolicyVersions.includes(option.value))
+                      .map(option => (
                       <option key={option.value} value={option.value}>{option.label}</option>
-                    ))}
+                      ))}
                   </select>
                   <button
                     onClick={handleAddBot}

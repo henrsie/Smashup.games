@@ -1,12 +1,19 @@
 const path = require('node:path');
 const { Worker } = require('node:worker_threads');
-const { getBotPolicy } = require('./botPolicies.js');
+const { BOT_POLICY_VERSIONS } = require('./botPolicies.js');
+const {
+    RL_BOT_POLICY_VERSIONS,
+    getRlBotRuntimeConfig,
+    isRlBotPolicy
+} = require('./rlBotPolicy.js');
 
 const MIN_BOT_MATCH_PLAYERS = 2;
 const MAX_BOT_MATCH_PLAYERS = 3;
 const BOT_MATCH_MAX_DECISIONS = 5_000;
 const BOT_MATCH_TIMEOUT_MS = 20_000;
+const BOT_MATCH_RL_TIMEOUT_MS = 120_000;
 const DEFAULT_MAX_CONCURRENT_BOT_MATCHES = 2;
+const BUILT_IN_BOT_MATCH_POLICY_VERSIONS = Object.freeze(Object.values(BOT_POLICY_VERSIONS));
 
 class BotMatchError extends Error {
     constructor(code, message) {
@@ -16,7 +23,17 @@ class BotMatchError extends Error {
     }
 }
 
-function validateBotMatchRequest(payload = {}) {
+function getAvailableBotMatchPolicyVersions() {
+    const policyVersions = [...BUILT_IN_BOT_MATCH_POLICY_VERSIONS];
+    if (getRlBotRuntimeConfig().available) {
+        policyVersions.push(...Object.values(RL_BOT_POLICY_VERSIONS));
+    }
+    return policyVersions;
+}
+
+function validateBotMatchRequest(payload = {}, {
+    availablePolicyVersions = getAvailableBotMatchPolicyVersions()
+} = {}) {
     const policyVersions = payload?.policyVersions;
     if (!Array.isArray(policyVersions)
         || policyVersions.length < MIN_BOT_MATCH_PLAYERS
@@ -26,7 +43,8 @@ function validateBotMatchRequest(payload = {}) {
             `Bot Mode requires ${MIN_BOT_MATCH_PLAYERS} or ${MAX_BOT_MATCH_PLAYERS} bots.`
         );
     }
-    if (policyVersions.some(policyVersion => !getBotPolicy(policyVersion))) {
+    const availablePolicyVersionSet = new Set(availablePolicyVersions);
+    if (policyVersions.some(policyVersion => !availablePolicyVersionSet.has(policyVersion))) {
         throw new BotMatchError('invalid_bot_policy', 'One or more bot strategies are not supported.');
     }
     if (payload.randomSeed !== undefined
@@ -44,12 +62,17 @@ function validateBotMatchRequest(payload = {}) {
 function runBotMatchInWorker(
     payload,
     {
-        timeoutMs = BOT_MATCH_TIMEOUT_MS,
+        timeoutMs,
         WorkerClass = Worker,
         workerPath = path.resolve(__dirname, 'botMatchWorker.js')
     } = {}
 ) {
     const options = validateBotMatchRequest(payload);
+    const effectiveTimeoutMs = timeoutMs ?? (
+        options.policyVersions.some(isRlBotPolicy)
+            ? BOT_MATCH_RL_TIMEOUT_MS
+            : BOT_MATCH_TIMEOUT_MS
+    );
 
     return new Promise((resolve, reject) => {
         const worker = new WorkerClass(workerPath, {
@@ -76,7 +99,7 @@ function runBotMatchInWorker(
                 reject,
                 new BotMatchError('bot_match_timeout', 'The bot match took too long and was stopped.')
             );
-        }, timeoutMs);
+        }, effectiveTimeoutMs);
         timeout.unref?.();
 
         worker.once('message', message => {
@@ -144,9 +167,11 @@ function createBotMatchJobManager({
 
 module.exports = {
     BOT_MATCH_MAX_DECISIONS,
+    BOT_MATCH_RL_TIMEOUT_MS,
     BOT_MATCH_TIMEOUT_MS,
     BotMatchError,
     createBotMatchJobManager,
+    getAvailableBotMatchPolicyVersions,
     runBotMatchInWorker,
     validateBotMatchRequest
 };

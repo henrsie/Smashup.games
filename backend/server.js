@@ -5,7 +5,10 @@ const { Server } = require('socket.io');
 const { buildBaseDeck } = require('./bases.js');
 const { factionsData, buildFactionDeck } = require('./factions.js');
 const { getTriggeredEffects } = require('./abilityQueue.js');
-const { createBotMatchJobManager } = require('./botMatchRunner.js');
+const {
+    createBotMatchJobManager,
+    getAvailableBotMatchPolicyVersions
+} = require('./botMatchRunner.js');
 const {
     ENTITY_ID_SCHEMA_VERSION,
     UNKNOWN_ENTITY_ID,
@@ -23,6 +26,11 @@ const {
     chooseGreedyHeuristic2ActionIndex,
     getBotPolicy
 } = require('./botPolicies.js');
+const {
+    createRoomRlPolicyClientManager,
+    getRlBotRuntimeConfig,
+    isRlBotPolicy
+} = require('./rlBotPolicy.js');
 const {
     RANDOM_ALGORITHM,
     generateRandomSeed,
@@ -97,6 +105,7 @@ const rooms = {};
 // Keep track of active disconnection timers: playerId -> NodeJS.Timeout
 const disconnectTimers = {};
 const botMatchJobManager = createBotMatchJobManager();
+const roomRlPolicyClientManager = createRoomRlPolicyClientManager();
 const botTurnController = createBotTurnController({
     getRoom: roomId => rooms[roomId],
     executeAction: ({ room, roomId, actorId, action }) => executeGameAction({
@@ -140,7 +149,8 @@ function addLobbyBot(
     room,
     requesterId,
     roomId = 'ROOM',
-    policyVersion = DEFAULT_BOT_POLICY_VERSION
+    policyVersion = DEFAULT_BOT_POLICY_VERSION,
+    { isPolicyAvailable = isAvailableRoomBotPolicy } = {}
 ) {
     if (!room) return failGameAction('room_not_found', 'Room not found.');
     if (room.gamePhase !== 'lobby') {
@@ -152,7 +162,7 @@ function addLobbyBot(
     if (room.players.length >= MAX_PLAYERS) {
         return failGameAction('lobby_full', `A game can have at most ${MAX_PLAYERS} players.`);
     }
-    if (!getBotPolicy(policyVersion)) {
+    if (!isPolicyAvailable(policyVersion)) {
         return failGameAction('invalid_bot_policy', 'That bot strategy is not supported.');
     }
 
@@ -180,6 +190,13 @@ function addLobbyBot(
     room.nextBotIdNumber = botIdNumber + 1;
     room.players.push(bot);
     return { ok: true, role: 'player', participant: bot };
+}
+
+function isAvailableRoomBotPolicy(policyVersion, {
+    rlAvailable = getRlBotRuntimeConfig().available
+} = {}) {
+    return Boolean(getBotPolicy(policyVersion))
+        || (rlAvailable && isRlBotPolicy(policyVersion));
 }
 
 function renumberLobbyBots(room) {
@@ -232,6 +249,7 @@ function destroyRoom(roomId) {
         delete disconnectTimers[player.id];
     });
     botTurnController.stop(roomId);
+    void roomRlPolicyClientManager.close(roomId);
     delete rooms[roomId];
     return true;
 }
@@ -271,6 +289,14 @@ function generateRoomId() {
 
 io.on('connection', (socket) => {
     console.log(`User connected: ${socket.id}`);
+
+    const emitBotMatchPolicyOptions = () => {
+        socket.emit('bot-match-policy-options', {
+            policyVersions: getAvailableBotMatchPolicyVersions()
+        });
+    };
+    emitBotMatchPolicyOptions();
+    socket.on('get-bot-match-policy-options', emitBotMatchPolicyOptions);
 
     socket.on('run-bot-match', async (payload = {}) => {
         try {
@@ -1964,6 +1990,7 @@ function finishGameIfNeeded(
         cloneResult: false
     });
     stopBotController(roomId);
+    void roomRlPolicyClientManager.close(roomId);
     return gameResult;
 }
 
@@ -2545,11 +2572,17 @@ function chooseDefaultBotActionIndex({ legalActions, random = systemRandom }) {
     );
 }
 
-function chooseConfiguredBotActionIndex(context) {
+async function chooseConfiguredBotActionIndex(context) {
     const player = context.room?.players?.find(candidate => candidate.id === context.actorId);
     const policyVersion = player?.policyVersion
         || context.room?.botPolicyVersion
         || DEFAULT_BOT_POLICY_VERSION;
+    if (isRlBotPolicy(policyVersion)) {
+        return roomRlPolicyClientManager.chooseAction({
+            ...context,
+            policyVersion
+        });
+    }
     const policy = getBotPolicy(policyVersion);
     if (!policy) throw new Error(`Unsupported bot policy: ${policyVersion}`);
     return policy(context);
@@ -6220,8 +6253,12 @@ function emitGameState(roomId, room) {
         battleLog: room.battleLog,
         gameResult: room.gameResult || null
     });
-    if (room.gamePhase === 'finished') botTurnController.stop(roomId);
-    else botTurnController.wake(roomId);
+    if (room.gamePhase === 'finished') {
+        botTurnController.stop(roomId);
+        void roomRlPolicyClientManager.close(roomId);
+    } else {
+        botTurnController.wake(roomId);
+    }
 }
 
 function shuffleDeck(deck, random = systemRandom) {
@@ -6540,10 +6577,13 @@ if (require.main === module) {
         console.log(`Server running on port ${PORT}`);
     });
 
-    const shutDown = () => {
+    const shutDown = async () => {
         console.log('Server shutting down');
 
         io.emit('server-restarting');
+        await roomRlPolicyClientManager.closeAll().catch(error => {
+            console.error(`Could not close RL policy workers cleanly: ${error.message}`);
+        });
 
         io.close(() => {
             process.exit(0);
@@ -6594,6 +6634,7 @@ module.exports = {
     getRecentStructuredEvents,
     getRoomTrajectory,
     getOngoingDiscardPlayBaseIndices,
+    isAvailableRoomBotPolicy,
     isMinionPlayPrevented,
     isMinionProtectedFromCard,
     isMovementPrevented,

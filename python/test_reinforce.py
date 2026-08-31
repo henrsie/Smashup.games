@@ -11,7 +11,9 @@ try:
     import torch
 
     from reinforce import (
+        EXTERNAL_PYTHON_POLICY_VERSION,
         ReinforceTransition,
+        build_training_lineup,
         calculate_discounted_returns,
         collect_episode,
         create_masked_action_policy,
@@ -92,8 +94,63 @@ class FakeEnvironment:
         return {"gameResult": {"winnerId": "player-1"}}
 
 
+class MixedPolicyFakeEnvironment(FakeEnvironment):
+    def __init__(self) -> None:
+        super().__init__()
+        self.built_in_policy_calls = []
+
+    def reset(self, **kwargs) -> dict:
+        state = super().reset(**kwargs)
+        state["observation"]["players"] = [
+            {"id": "player-1"},
+            {"id": "player-2"},
+        ]
+        return state
+
+    def choose_builtin_action(self, policy_version: str) -> int:
+        self.built_in_policy_calls.append(policy_version)
+        return 0
+
+
 @unittest.skipIf(torch is None, "PyTorch is not installed in this environment.")
 class ReinforceTests(unittest.TestCase):
+    def test_training_lineup_rotates_the_learned_seat_and_samples_opponents(self) -> None:
+        opponent_pool = ("random-v1", "greedy_heuristic_1", "greedy_heuristic_2")
+
+        first_lineup = build_training_lineup(
+            player_count=3,
+            episode_number=1,
+            seed=380,
+            heuristic_game_probability=1.0,
+            opponent_policies=opponent_pool,
+        )
+        second_lineup = build_training_lineup(
+            player_count=3,
+            episode_number=2,
+            seed=381,
+            heuristic_game_probability=1.0,
+            opponent_policies=opponent_pool,
+        )
+        self_play_lineup = build_training_lineup(
+            player_count=3,
+            episode_number=3,
+            seed=382,
+            heuristic_game_probability=0.0,
+            opponent_policies=opponent_pool,
+        )
+
+        self.assertEqual(first_lineup[0], EXTERNAL_PYTHON_POLICY_VERSION)
+        self.assertEqual(second_lineup[1], EXTERNAL_PYTHON_POLICY_VERSION)
+        self.assertTrue(all(
+            policy in opponent_pool
+            for seat, policy in enumerate(first_lineup)
+            if seat != 0
+        ))
+        self.assertEqual(
+            self_play_lineup,
+            [EXTERNAL_PYTHON_POLICY_VERSION] * 3,
+        )
+
     def test_returns_follow_each_players_decision_sequence(self) -> None:
         transitions = [
             ReinforceTransition("p1", {}, [], 0, reward=0.2),
@@ -127,6 +184,32 @@ class ReinforceTests(unittest.TestCase):
             [transition.discounted_return for transition in rollout.transitions],
             [0.7, -1.0, 1.0],
         )
+
+    def test_mixed_episode_records_only_the_neural_policy_actions(self) -> None:
+        environment = MixedPolicyFakeEnvironment()
+
+        rollout = collect_episode(
+            environment,
+            FirstActionPolicy(),
+            player_count=2,
+            gamma=0.5,
+            policy_versions=[
+                EXTERNAL_PYTHON_POLICY_VERSION,
+                "greedy_heuristic_1",
+            ],
+        )
+
+        self.assertEqual(environment.built_in_policy_calls, ["greedy_heuristic_1"])
+        self.assertEqual(
+            [transition.player_id for transition in rollout.transitions],
+            ["player-1", "player-1"],
+        )
+        self.assertEqual(
+            [transition.discounted_return for transition in rollout.transitions],
+            [0.7, 1.0],
+        )
+        self.assertEqual(rollout.decision_count, 3)
+        self.assertEqual(rollout.learned_player_ids, ["player-1"])
 
     def test_policy_scores_only_the_supplied_legal_actions(self) -> None:
         policy = create_masked_action_policy(state_size=32, component_size=16, hidden_size=24)

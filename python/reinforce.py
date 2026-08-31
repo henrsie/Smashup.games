@@ -5,8 +5,9 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import random
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 
@@ -20,7 +21,11 @@ from action_embeddings import (
     create_entity_embeddings,
     load_entity_registry,
 )
-from node_env import NodeSmashUpEnv
+from node_env import (
+    BUILT_IN_POLICY_VERSIONS,
+    EXTERNAL_PYTHON_POLICY_VERSION,
+    NodeSmashUpEnv,
+)
 from observation_encoder import ObservationEncoder, create_observation_encoder
 
 
@@ -31,6 +36,11 @@ DEFAULT_CHECKPOINT_PATH = (
     / "reinforce.pt"
 )
 CHECKPOINT_SCHEMA_VERSION = 1
+DEFAULT_TRAINING_OPPONENT_POLICIES = (
+    "random-v1",
+    "greedy_heuristic_1",
+    "greedy_heuristic_2",
+)
 
 
 @dataclass
@@ -55,6 +65,8 @@ class EpisodeRollout:
     truncated: bool
     decision_count: int
     game_result: Optional[Mapping[str, Any]] = None
+    policy_versions: list[str] = field(default_factory=list)
+    learned_player_ids: list[str] = field(default_factory=list)
 
 
 class MaskedActionPolicy(nn.Module):
@@ -207,6 +219,52 @@ def _finite_reward(value: Any, *, player_id: str) -> float:
     return reward
 
 
+def build_training_lineup(
+    *,
+    player_count: int,
+    episode_number: int,
+    seed: int | str,
+    heuristic_game_probability: float,
+    opponent_policies: Sequence[str],
+) -> list[str]:
+    """Create a reproducible self-play or one-learner mixed-policy lineup."""
+    if player_count not in (2, 3, 4):
+        raise ValueError("player_count must be 2, 3, or 4.")
+    if (
+        isinstance(episode_number, bool)
+        or not isinstance(episode_number, int)
+        or episode_number < 1
+    ):
+        raise ValueError("episode_number must be a positive integer.")
+    if (
+        isinstance(heuristic_game_probability, bool)
+        or not isinstance(heuristic_game_probability, (int, float))
+        or not math.isfinite(float(heuristic_game_probability))
+        or not 0.0 <= float(heuristic_game_probability) <= 1.0
+    ):
+        raise ValueError("heuristic_game_probability must be between 0 and 1.")
+    unsupported = [
+        policy_version for policy_version in opponent_policies
+        if policy_version not in BUILT_IN_POLICY_VERSIONS
+    ]
+    if unsupported:
+        raise ValueError(f"Unsupported built-in opponent policy: {unsupported[0]}")
+
+    lineup_random = random.Random(f"{seed!r}:training-lineup:{episode_number}")
+    if lineup_random.random() >= float(heuristic_game_probability):
+        return [EXTERNAL_PYTHON_POLICY_VERSION] * player_count
+    if not opponent_policies:
+        raise ValueError("opponent_policies cannot be empty for heuristic games.")
+
+    learned_seat = (episode_number - 1) % player_count
+    return [
+        EXTERNAL_PYTHON_POLICY_VERSION
+        if seat == learned_seat
+        else lineup_random.choice(opponent_policies)
+        for seat in range(player_count)
+    ]
+
+
 def collect_episode(
     environment: NodeSmashUpEnv,
     policy: MaskedActionPolicy,
@@ -216,18 +274,55 @@ def collect_episode(
     max_decisions: int = 10_000,
     gamma: float = 1.0,
     generator: Optional[torch.Generator] = None,
+    policy_versions: Optional[Sequence[str]] = None,
 ) -> EpisodeRollout:
-    """Run one on-policy game and attribute rewards to each player's latest action."""
+    """Run a game and retain on-policy decisions from neural-policy seats only."""
+    if policy_versions is not None and len(policy_versions) != player_count:
+        raise ValueError("policy_versions must contain one entry per player seat.")
+    resolved_policy_versions = list(
+        policy_versions
+        or [EXTERNAL_PYTHON_POLICY_VERSION] * player_count
+    )
+    unsupported = [
+        policy_version for policy_version in resolved_policy_versions
+        if policy_version != EXTERNAL_PYTHON_POLICY_VERSION
+        and policy_version not in BUILT_IN_POLICY_VERSIONS
+    ]
+    if unsupported:
+        raise ValueError(f"Unsupported training policy version: {unsupported[0]}")
+    if EXTERNAL_PYTHON_POLICY_VERSION not in resolved_policy_versions:
+        raise ValueError("At least one player seat must use the trainable policy.")
     state = environment.reset(
         seed=seed,
         player_count=player_count,
         max_decisions=max_decisions,
         record_trajectory=False,
+        policy_versions=resolved_policy_versions,
     )
+    initial_observation = state.get("observation")
+    players = initial_observation.get("players") if isinstance(initial_observation, Mapping) else None
+    if policy_versions is None and not isinstance(players, list):
+        player_policy_versions: dict[str, str] = {}
+        learned_player_ids: list[str] = []
+    else:
+        if not isinstance(players, list) or len(players) != player_count:
+            raise ValueError("Node did not return the players for the configured lineup.")
+        player_policy_versions = {
+            str(player.get("id")): policy_version
+            for player, policy_version in zip(players, resolved_policy_versions)
+            if isinstance(player, Mapping) and isinstance(player.get("id"), str)
+        }
+        if len(player_policy_versions) != player_count:
+            raise ValueError("Node returned an invalid player order for the configured lineup.")
+        learned_player_ids = [
+            player_id for player_id, policy_version in player_policy_versions.items()
+            if policy_version == EXTERNAL_PYTHON_POLICY_VERSION
+        ]
     transitions: list[ReinforceTransition] = []
     pending_transition_by_player: dict[str, int] = {}
     accrued_rewards: dict[str, float] = defaultdict(float)
     total_rewards: dict[str, float] = defaultdict(float)
+    decision_count = 0
 
     while True:
         observation = state.get("observation")
@@ -244,25 +339,35 @@ def collect_episode(
         actor_id = observation.get("observerPlayerId")
         if not isinstance(actor_id, str):
             raise ValueError("Node did not identify the observation's acting player.")
-
-        previous_index = pending_transition_by_player.get(actor_id)
-        if previous_index is not None:
-            transitions[previous_index].reward = accrued_rewards.pop(actor_id, 0.0)
-
-        action_index = policy.sample_action(
-            observation,
-            legal_actions,
-            generator=generator,
+        actor_policy_version = player_policy_versions.get(
+            actor_id,
+            EXTERNAL_PYTHON_POLICY_VERSION,
         )
-        transitions.append(ReinforceTransition(
-            player_id=actor_id,
-            observation=observation,
-            legal_actions=legal_actions,
-            action_index=action_index,
-        ))
-        pending_transition_by_player[actor_id] = len(transitions) - 1
+
+        if actor_policy_version == EXTERNAL_PYTHON_POLICY_VERSION:
+            if actor_id not in learned_player_ids:
+                learned_player_ids.append(actor_id)
+            previous_index = pending_transition_by_player.get(actor_id)
+            if previous_index is not None:
+                transitions[previous_index].reward = accrued_rewards.pop(actor_id, 0.0)
+
+            action_index = policy.sample_action(
+                observation,
+                legal_actions,
+                generator=generator,
+            )
+            transitions.append(ReinforceTransition(
+                player_id=actor_id,
+                observation=observation,
+                legal_actions=legal_actions,
+                action_index=action_index,
+            ))
+            pending_transition_by_player[actor_id] = len(transitions) - 1
+        else:
+            action_index = environment.choose_builtin_action(actor_policy_version)
 
         state = environment.step(action_index)
+        decision_count += 1
         next_info = state.get("info")
         rewards_by_player = next_info.get("rewardsByPlayer") if isinstance(next_info, Mapping) else None
         if not isinstance(rewards_by_player, Mapping):
@@ -284,8 +389,10 @@ def collect_episode(
                 rewards_by_player=dict(total_rewards),
                 terminated=terminated,
                 truncated=truncated,
-                decision_count=len(transitions),
+                decision_count=int(result.get("decisionCount", decision_count)),
                 game_result=result.get("gameResult") if isinstance(result, Mapping) else None,
+                policy_versions=resolved_policy_versions,
+                learned_player_ids=learned_player_ids,
             )
 
 
@@ -506,6 +613,22 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--hidden-size", type=int, default=256)
     parser.add_argument("--device", default="cpu")
+    parser.add_argument(
+        "--heuristic-game-probability",
+        type=float,
+        default=0.5,
+        help=(
+            "Probability that an episode uses one learned seat and built-in opponents; "
+            "the remaining episodes use full self-play."
+        ),
+    )
+    parser.add_argument(
+        "--opponent-policies",
+        nargs="+",
+        choices=BUILT_IN_POLICY_VERSIONS,
+        default=DEFAULT_TRAINING_OPPONENT_POLICIES,
+        help="Built-in policies sampled independently for non-learned seats.",
+    )
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument(
         "--resume",
@@ -526,6 +649,8 @@ def _validate_training_args(args: argparse.Namespace) -> None:
         raise ValueError("--gamma must be between 0 and 1.")
     if args.learning_rate <= 0:
         raise ValueError("--learning-rate must be positive.")
+    if not 0.0 <= args.heuristic_game_probability <= 1.0:
+        raise ValueError("--heuristic-game-probability must be between 0 and 1.")
 
 
 def train_reinforce(args: argparse.Namespace) -> dict[str, Any]:
@@ -561,6 +686,8 @@ def train_reinforce(args: argparse.Namespace) -> dict[str, Any]:
         "batchSize": args.batch_size,
         "episodesPerUpdate": args.episodes_per_update,
         "checkpointEvery": args.checkpoint_every,
+        "heuristicGameProbability": args.heuristic_game_probability,
+        "opponentPolicies": list(args.opponent_policies),
         "normalizeReturns": not args.no_normalize_returns,
         "stateSize": policy.observation_encoder.state_size,
         "componentSize": policy.observation_encoder.component_size,
@@ -571,6 +698,8 @@ def train_reinforce(args: argparse.Namespace) -> dict[str, Any]:
     updates_completed = starting_updates
     trained_episodes = 0
     truncated_episodes = 0
+    heuristic_episodes = 0
+    self_play_episodes = 0
     last_metrics: dict[str, float] = {}
     periodic_checkpoints: list[str] = []
 
@@ -596,13 +725,31 @@ def train_reinforce(args: argparse.Namespace) -> dict[str, Any]:
 
     with NodeSmashUpEnv(args.base_url) as environment:
         for episode_index in range(args.episodes):
+            episode_number = starting_episodes + episode_index + 1
+            episode_seed = args.seed + starting_episodes + episode_index
+            policy_versions = build_training_lineup(
+                player_count=args.player_count,
+                episode_number=episode_number,
+                seed=episode_seed,
+                heuristic_game_probability=args.heuristic_game_probability,
+                opponent_policies=args.opponent_policies,
+            )
+            is_heuristic_episode = any(
+                policy_version != EXTERNAL_PYTHON_POLICY_VERSION
+                for policy_version in policy_versions
+            )
+            if is_heuristic_episode:
+                heuristic_episodes += 1
+            else:
+                self_play_episodes += 1
             rollout = collect_episode(
                 environment,
                 policy,
-                seed=args.seed + starting_episodes + episode_index,
+                seed=episode_seed,
                 player_count=args.player_count,
                 max_decisions=args.max_decisions,
                 gamma=args.gamma,
+                policy_versions=policy_versions,
             )
             if rollout.truncated:
                 truncated_episodes += 1
@@ -610,12 +757,23 @@ def train_reinforce(args: argparse.Namespace) -> dict[str, Any]:
                     "episode": episode_index + 1,
                     "status": "truncated-skipped",
                     "decisionCount": rollout.decision_count,
+                    "lineup": rollout.policy_versions,
+                    "learnedPlayerIds": rollout.learned_player_ids,
                 }))
                 continue
 
             rollout_batch.extend(rollout.transitions)
             episodes_in_batch += 1
             trained_episodes += 1
+            print(json.dumps({
+                "episode": episode_index + 1,
+                "status": "rollout-completed",
+                "mode": "heuristic-opponents" if is_heuristic_episode else "self-play",
+                "lineup": rollout.policy_versions,
+                "learnedPlayerIds": rollout.learned_player_ids,
+                "policyTransitions": len(rollout.transitions),
+                "decisionCount": rollout.decision_count,
+            }))
             total_trained_episodes = starting_episodes + trained_episodes
             checkpoint_due = (
                 args.checkpoint_every > 0
@@ -672,6 +830,8 @@ def train_reinforce(args: argparse.Namespace) -> dict[str, Any]:
         "trainedEpisodes": trained_episodes,
         "totalTrainedEpisodes": starting_episodes + trained_episodes,
         "truncatedEpisodes": truncated_episodes,
+        "heuristicEpisodes": heuristic_episodes,
+        "selfPlayEpisodes": self_play_episodes,
         "updatesCompleted": updates_completed,
         "checkpoint": str(checkpoint_path),
         "periodicCheckpoints": periodic_checkpoints,

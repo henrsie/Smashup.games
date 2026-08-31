@@ -8,6 +8,15 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 
+BUILT_IN_POLICY_VERSIONS = (
+    "random-v1",
+    "first-legal-v1",
+    "greedy_heuristic_1",
+    "greedy_heuristic_2",
+)
+EXTERNAL_PYTHON_POLICY_VERSION = "external-python-v1"
+
+
 class NodeEnvironmentError(RuntimeError):
     """Raised when the Node environment rejects a request or is unavailable."""
 
@@ -74,7 +83,7 @@ class NodeSmashUpEnv:
             "playerCount": player_count,
             "maxDecisions": max_decisions,
             "recordTrajectory": record_trajectory,
-            "policyVersion": "external-python-v1",
+            "policyVersion": EXTERNAL_PYTHON_POLICY_VERSION,
         }
         if policy_versions is not None:
             payload["policyVersions"] = list(policy_versions)

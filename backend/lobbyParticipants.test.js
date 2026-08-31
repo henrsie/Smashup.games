@@ -8,6 +8,7 @@ const {
     removeLobbyBot,
     roomHasHumanPlayers
 } = require('./server.js');
+const { RL_BOT_POLICY_VERSIONS } = require('./rlBotPolicy.js');
 
 function createLobby(playerCount) {
     return {
@@ -104,6 +105,21 @@ test('the host can add bots with different supported policies', () => {
     assert.equal(secondResult.ok, true);
     assert.equal(secondResult.participant.policyVersion, BOT_POLICY_VERSIONS.GREEDY_HEURISTIC_2);
     assert.equal(invalidResult.code, 'invalid_bot_policy');
+});
+
+test('the host can add an available checkpoint-backed RL bot', () => {
+    const room = createLobby(1);
+
+    const result = addLobbyBot(
+        room,
+        'player-1',
+        'ROOM1',
+        RL_BOT_POLICY_VERSIONS.DETERMINISTIC,
+        { isPolicyAvailable: () => true }
+    );
+
+    assert.equal(result.ok, true);
+    assert.equal(result.participant.policyVersion, RL_BOT_POLICY_VERSIONS.DETERMINISTIC);
 });
 
 test('only the host can add a bot', () => {

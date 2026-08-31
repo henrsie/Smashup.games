@@ -12,7 +12,11 @@ from typing import Any, Mapping, Optional, Sequence
 
 import torch
 
-from node_env import NodeSmashUpEnv
+from node_env import (
+    BUILT_IN_POLICY_VERSIONS,
+    EXTERNAL_PYTHON_POLICY_VERSION,
+    NodeSmashUpEnv,
+)
 from reinforce import (
     DEFAULT_CHECKPOINT_PATH,
     MaskedActionPolicy,
@@ -20,19 +24,13 @@ from reinforce import (
 )
 
 
-BUILT_IN_POLICY_VERSIONS = (
-    "random-v1",
-    "first-legal-v1",
-    "greedy_heuristic_1",
-    "greedy_heuristic_2",
-)
 DEFAULT_OPPONENTS = (
     "random-v1",
     "first-legal-v1",
     "greedy_heuristic_1",
     "greedy_heuristic_2",
 )
-LEARNED_POLICY_VERSION = "reinforce-checkpoint-v1"
+LEARNED_POLICY_VERSION = EXTERNAL_PYTHON_POLICY_VERSION
 
 
 def build_evaluation_jobs(
@@ -41,7 +39,7 @@ def build_evaluation_jobs(
     games_per_seat: int,
     player_count: int,
     seed: int,
-    max_decisions: int = 10_000,
+    max_decisions: int = 1000,
     sample_actions: bool = False,
 ) -> list[dict[str, Any]]:
     """Create independent, reproducible game jobs for local or parallel evaluation."""
@@ -99,7 +97,7 @@ def run_evaluation_game(
     learned_seat: int,
     player_count: int,
     seed: int,
-    max_decisions: int = 10_000,
+    max_decisions: int = 1000,
     sample_actions: bool = False,
 ) -> dict[str, Any]:
     """Run one game with the checkpoint in one seat and built-in bots elsewhere."""
