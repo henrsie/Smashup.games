@@ -1,0 +1,5 @@
+services:
+  - type: web
+    name: smashup.games
+    env: docker          
+    plan: free          

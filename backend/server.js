@@ -82,7 +82,14 @@ const createInitialTurnState = () => ({
 const app = express();
 
 app.get('/health', (request, response) => {
-    response.status(200).json({ status: 'ok' });
+    const rlRuntime = getRlBotRuntimeConfig();
+    response.status(200).json({
+        status: 'ok',
+        rlBotRuntime: {
+            available: rlRuntime.available,
+            missing: rlRuntime.missing
+        }
+    });
 });
 
 if (process.env.NODE_ENV === 'production') {

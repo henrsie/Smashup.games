@@ -1,0 +1,17 @@
+.git
+.github
+.venv
+**/__pycache__
+**/*.pyc
+**/node_modules
+frontend/dist
+coverage
+training-data/trajectories
+training-data/evaluations
+training-data/checkpoints/*
+!training-data/checkpoints/reinforce.pt
+*.log
+*.swp
+*.swo
+*~
+.DS_Store
