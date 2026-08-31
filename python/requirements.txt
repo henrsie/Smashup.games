@@ -1,1 +1,3 @@
-torch
+modal==1.2.6
+numpy==2.0.2
+torch==2.8.0

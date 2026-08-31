@@ -9,6 +9,7 @@ try:
 
     from evaluate_reinforce import (
         DEFAULT_OPPONENTS,
+        build_evaluation_jobs,
         run_evaluation_game,
         summarize_evaluation,
     )
@@ -68,6 +69,27 @@ class EvaluationTests(unittest.TestCase):
             "greedy_heuristic_1",
             "greedy_heuristic_2",
         ))
+
+    def test_evaluation_jobs_rotate_each_seed_through_every_seat(self) -> None:
+        jobs = build_evaluation_jobs(
+            opponents=("random-v1", "first-legal-v1"),
+            games_per_seat=2,
+            player_count=3,
+            seed=380,
+            max_decisions=500,
+            sample_actions=True,
+        )
+
+        self.assertEqual(len(jobs), 12)
+        self.assertEqual(
+            [job["learnedSeat"] for job in jobs[:3]],
+            [0, 1, 2],
+        )
+        self.assertEqual({job["seed"] for job in jobs[:3]}, {380})
+        self.assertEqual({job["seed"] for job in jobs[3:6]}, {381})
+        self.assertEqual(jobs[6]["opponentPolicy"], "first-legal-v1")
+        self.assertEqual(len({job["policySeed"] for job in jobs}), len(jobs))
+        self.assertTrue(all(job["sampleActions"] for job in jobs))
 
     def test_evaluation_game_records_the_checkpoint_seat_result(self) -> None:
         record = run_evaluation_game(

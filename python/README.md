@@ -309,6 +309,45 @@ truncations. Learned actions use deterministic argmax selection by default; add
 `--sample-actions` to evaluate the stochastic policy instead. Evaluation JSON is
 ignored by Git.
 
+### Parallel evaluation on Modal
+
+`modal_evaluate.py` runs the same evaluation games on independent Modal CPU
+workers. Each worker container starts one private Node headless server, loads the
+checkpoint once, and reuses both across the games assigned to that container.
+Modal distributes the game jobs across containers; Node remains authoritative for
+legal actions and state transitions exactly as it is during local evaluation.
+
+Install the Modal client and authenticate it once:
+
+```bash
+.venv/bin/python -m pip install -r python/requirements.txt
+.venv/bin/modal setup
+```
+
+Then run the parallel evaluator from the repository root:
+
+```bash
+./scripts/evaluate_training_modal.sh
+```
+
+The command hashes and uploads the selected local checkpoint to the
+`smashup-rl-data` Modal Volume, fans out every `(opponent, seed, learned seat)`
+game, aggregates results on the local machine, and writes
+`training-data/evaluations/reinforce-modal.json`. No separately running local Node
+server is needed. The default run creates 60 games and allows Modal to use up to
+20 containers. Limit cost or raise parallelism with:
+
+```bash
+./scripts/evaluate_training_modal.sh \
+  --games-per-seat 20 \
+  --max-workers 8
+```
+
+The Modal workers intentionally use CPUs: for this small policy, game simulation
+in Node is the dominant work and assigning one GPU per game would add cost without
+meaningful benefit. Keep the command attached when you want the JSON report saved
+locally; the local entrypoint performs the final aggregation and file write.
+
 ## Bash training commands
 
 The repository includes executable wrappers that resolve the project and virtual
@@ -318,6 +357,7 @@ environment paths even when invoked from another working directory:
 ./scripts/train.sh
 ./scripts/resume_training.sh
 ./scripts/evaluate_training.sh
+./scripts/evaluate_training_modal.sh
 ```
 
 They use the documented defaults while forwarding additional arguments to the
@@ -343,10 +383,12 @@ SMASHUP_SEED
 SMASHUP_GAMES_PER_SEAT
 SMASHUP_EVALUATION_SEED
 SMASHUP_EVALUATION_OUTPUT
+SMASHUP_MODAL_MAX_WORKERS
 ```
 
-The Node environment server must already be running. The wrappers can be detached
-with `nohup` in the same way as the direct Python commands:
+The local train, resume, and evaluation wrappers require the Node environment
+server to already be running. They can be detached with `nohup` in the same way as
+the direct Python commands:
 
 ```bash
 mkdir -p training-data/logs

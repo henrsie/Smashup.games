@@ -35,6 +35,48 @@ DEFAULT_OPPONENTS = (
 LEARNED_POLICY_VERSION = "reinforce-checkpoint-v1"
 
 
+def build_evaluation_jobs(
+    *,
+    opponents: Sequence[str],
+    games_per_seat: int,
+    player_count: int,
+    seed: int,
+    max_decisions: int = 10_000,
+    sample_actions: bool = False,
+) -> list[dict[str, Any]]:
+    """Create independent, reproducible game jobs for local or parallel evaluation."""
+    if games_per_seat < 1:
+        raise ValueError("games_per_seat must be positive.")
+    if player_count not in (2, 3, 4):
+        raise ValueError("player_count must be 2, 3, or 4.")
+    if max_decisions < 1:
+        raise ValueError("max_decisions must be positive.")
+    unsupported = [
+        opponent for opponent in opponents
+        if opponent not in BUILT_IN_POLICY_VERSIONS
+    ]
+    if unsupported:
+        raise ValueError(f"Unsupported built-in opponent policy: {unsupported[0]}")
+
+    jobs: list[dict[str, Any]] = []
+    for opponent_policy in opponents:
+        for game_index in range(games_per_seat):
+            game_seed = seed + game_index
+            for learned_seat in range(player_count):
+                evaluation_game = len(jobs) + 1
+                jobs.append({
+                    "evaluationGame": evaluation_game,
+                    "opponentPolicy": opponent_policy,
+                    "learnedSeat": learned_seat,
+                    "playerCount": player_count,
+                    "seed": game_seed,
+                    "policySeed": seed + evaluation_game - 1,
+                    "maxDecisions": max_decisions,
+                    "sampleActions": sample_actions,
+                })
+    return jobs
+
+
 @torch.no_grad()
 def choose_checkpoint_action(
     policy: MaskedActionPolicy,
@@ -180,35 +222,36 @@ def summarize_evaluation(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]
 
 def evaluate_checkpoint(args: argparse.Namespace) -> dict[str, Any]:
     """Load a checkpoint and evaluate it over controlled seeds and every seat."""
-    if args.games_per_seat < 1:
-        raise ValueError("--games-per-seat must be positive.")
-    if args.max_decisions < 1:
-        raise ValueError("--max-decisions must be positive.")
-    torch.manual_seed(args.seed)
+    jobs = build_evaluation_jobs(
+        opponents=args.opponents,
+        games_per_seat=args.games_per_seat,
+        player_count=args.player_count,
+        seed=args.seed,
+        max_decisions=args.max_decisions,
+        sample_actions=args.sample_actions,
+    )
     policy, checkpoint = load_reinforce_checkpoint(args.checkpoint, device=args.device)
     policy.eval()
     records: list[dict[str, Any]] = []
 
     with NodeSmashUpEnv(args.base_url) as environment:
-        for opponent_policy in args.opponents:
-            for game_index in range(args.games_per_seat):
-                game_seed = args.seed + game_index
-                for learned_seat in range(args.player_count):
-                    record = run_evaluation_game(
-                        environment,
-                        policy,
-                        opponent_policy=opponent_policy,
-                        learned_seat=learned_seat,
-                        player_count=args.player_count,
-                        seed=game_seed,
-                        max_decisions=args.max_decisions,
-                        sample_actions=args.sample_actions,
-                    )
-                    records.append(record)
-                    print(json.dumps({
-                        "evaluationGame": len(records),
-                        **record,
-                    }))
+        for job in jobs:
+            torch.manual_seed(job["policySeed"])
+            record = run_evaluation_game(
+                environment,
+                policy,
+                opponent_policy=job["opponentPolicy"],
+                learned_seat=job["learnedSeat"],
+                player_count=job["playerCount"],
+                seed=job["seed"],
+                max_decisions=job["maxDecisions"],
+                sample_actions=job["sampleActions"],
+            )
+            records.append(record)
+            print(json.dumps({
+                "evaluationGame": job["evaluationGame"],
+                **record,
+            }))
 
     report = {
         "evaluationSchemaVersion": 1,
