@@ -510,6 +510,7 @@ io.on('connection', (socket) => {
             roomId,
             actorId: socket.id,
             action: { type: 'end-turn' },
+            actorTransport: socket,
             emitState: emitGameState,
             emitRoomEvent: (targetRoomId, event, eventPayload) => {
                 io.to(targetRoomId).emit(event, eventPayload);
@@ -1040,7 +1041,7 @@ function executeResolveAbilityChoiceAction({ room, roomId, actorId, action, acto
             error: 'That hand card is no longer a valid target.'
         },
         handLimitDiscard: {
-            resolve: () => resolveBotHandLimitDiscard(room, actor, choice),
+            resolve: () => resolveHandLimitDiscard(room, roomId, actor, choice),
             code: 'invalid_hand_limit_discard',
             error: 'That card is no longer a valid hand-limit discard.',
             resume: false
@@ -1347,8 +1348,26 @@ function drawEndTurnCards(room, player) {
     }
 }
 
-function queueBotHandLimitDiscard(room, player) {
-    if (player?.isBot !== true || player.hand.length <= MAX_HAND_SIZE) return false;
+function getHandLimitDiscardChoiceRequest(roomId, player) {
+    const cardsRemaining = player.hand.length - MAX_HAND_SIZE;
+    return {
+        roomId,
+        message: `Your hand has ${player.hand.length} cards. Choose a card to discard (${cardsRemaining} remaining).`,
+        choices: player.hand.map(card => ({
+            choiceId: `card:${card.instanceId}`,
+            cardInstanceId: card.instanceId,
+            label: `${card.name}${card.type === 'minion' ? ` (Power: ${getPrintedCardPower(card)})` : ''}`
+        }))
+    };
+}
+
+function emitHandLimitDiscardChoice(room, roomId, actor, player) {
+    if (room?.headless === true || player?.isBot === true) return;
+    emitActorEvent(actor, 'ability-choice-required', getHandLimitDiscardChoiceRequest(roomId, player));
+}
+
+function queueHandLimitDiscard(room, roomId, player, actor) {
+    if (!player || player.hand.length <= MAX_HAND_SIZE) return false;
 
     room.pendingAbility = {
         type: 'handLimitDiscard',
@@ -1357,14 +1376,15 @@ function queueBotHandLimitDiscard(room, player) {
         candidateIds: player.hand.map(card => card.instanceId),
         cardsRemaining: player.hand.length - MAX_HAND_SIZE
     };
+    emitHandLimitDiscardChoice(room, roomId, actor, player);
     return true;
 }
 
-function resolveBotHandLimitDiscard(room, actor, choice) {
+function resolveHandLimitDiscard(room, roomId, actor, choice) {
     const pendingAbility = room.pendingAbility;
     const player = room.players.find(candidate => candidate.id === actor.id);
     if (pendingAbility?.type !== 'handLimitDiscard'
-        || player?.isBot !== true
+        || !player
         || player.hand.length <= MAX_HAND_SIZE
         || !pendingAbility.candidateIds.includes(choice?.cardInstanceId)) return false;
 
@@ -1383,6 +1403,7 @@ function resolveBotHandLimitDiscard(room, actor, choice) {
     if (player.hand.length > MAX_HAND_SIZE) {
         pendingAbility.candidateIds = player.hand.map(card => card.instanceId);
         pendingAbility.cardsRemaining = player.hand.length - MAX_HAND_SIZE;
+        emitHandLimitDiscardChoice(room, roomId, actor, player);
     } else {
         const endingPlayerId = pendingAbility.endingPlayerId;
         room.pendingAbility = null;
@@ -1411,6 +1432,7 @@ function executeEndTurnAction({
     room,
     roomId,
     actorId,
+    actorTransport,
     emitState,
     scheduleAction = setTimeout,
     roomStillExists = () => true
@@ -1465,7 +1487,7 @@ function executeEndTurnAction({
                 cleanupDelayedDiscardCards(room);
                 clearTemporaryEffects(room);
                 if (finishGameIfNeeded(room, roomId)) return;
-                if (queueBotHandLimitDiscard(room, player)) return;
+                if (queueHandLimitDiscard(room, roomId, player, actorTransport || { id: actorId })) return;
                 advanceToNextTurn(room, actorId);
             };
             const scoreEligibleBases = () => {
@@ -1505,7 +1527,7 @@ function executeEndTurnAction({
             turnCompleted: true
         };
     }
-    if (queueBotHandLimitDiscard(room, player)) {
+    if (queueHandLimitDiscard(room, roomId, player, actorTransport || { id: actorId })) {
         return {
             ok: true,
             pendingAbility: room.pendingAbility,
@@ -1560,6 +1582,7 @@ function executeGameAction({
             room,
             roomId,
             actorId,
+            actorTransport,
             emitState,
             scheduleAction,
             roomStillExists
@@ -2340,7 +2363,7 @@ function getLegalAbilityChoiceActions(room, actorId) {
                 .map(cardInstanceId => ({ cardInstanceId })));
         }
         case 'handLimitDiscard':
-            if (player.isBot !== true || player.hand.length <= MAX_HAND_SIZE) return [];
+            if (player.hand.length <= MAX_HAND_SIZE) return [];
             return fromChoices(existingCardIds(player.hand, pending.candidateIds)
                 .map(cardInstanceId => ({ cardInstanceId })));
         case 'baseDeckSwap':

@@ -425,6 +425,10 @@ test('a bot must discard down to the ten-card hand limit before the next turn', 
     assert.equal(room.pendingAbility.cardsRemaining, 2);
     assert.equal(bot.hand.length, 12);
     assert.equal(getLegalActions(room, 'bot-1').length, 12);
+    assert.ok(getLegalActions(room, 'bot-1').every(action => (
+        action.type === 'resolve-ability-choice'
+        && action.choice?.cardInstanceId
+    )));
 
     const firstDiscard = getLegalActions(room, 'bot-1')[0];
     const firstDiscardResult = executeGameAction({
@@ -456,7 +460,7 @@ test('a bot must discard down to the ten-card hand limit before the next turn', 
     assert.match(room.battleLog[1], /discards.*to meet the hand limit/);
 });
 
-test('human players may temporarily exceed the hand limit for playtesting', () => {
+test('a human chooses cards to discard down to the ten-card hand limit', () => {
     const room = createRoom('human-player');
     const human = room.players[0];
     human.hand = Array.from({ length: MAX_HAND_SIZE }, (_, index) => (
@@ -466,19 +470,63 @@ test('human players may temporarily exceed the hand limit for playtesting', () =
         createCard('dino_armor_1', human.id, 'human-draw-1'),
         createCard('dino_bro_1', human.id, 'human-draw-2')
     ];
+    const emittedEvents = [];
+    const actorTransport = {
+        id: human.id,
+        emit(event, payload) {
+            emittedEvents.push({ event, payload });
+        }
+    };
 
     const result = executeGameAction({
         room,
         roomId: 'ROOM1',
         actorId: human.id,
-        action: { type: 'end-turn' }
+        action: { type: 'end-turn' },
+        actorTransport
     });
 
     assert.equal(result.ok, true);
-    assert.equal(result.turnCompleted, true);
+    assert.equal(result.turnCompleted, false);
     assert.equal(human.hand.length, 12);
+    assert.equal(room.pendingAbility.type, 'handLimitDiscard');
+    assert.equal(room.pendingAbility.cardsRemaining, 2);
+    assert.equal(room.currentTurnPlayerId, 'human-player');
+    assert.equal(emittedEvents.length, 1);
+    assert.equal(emittedEvents[0].event, 'ability-choice-required');
+    assert.equal(emittedEvents[0].payload.choices.length, 12);
+    assert.match(emittedEvents[0].payload.message, /Choose a card to discard \(2 remaining\)/);
+    assert.equal(getLegalActions(room, human.id).length, 12);
+
+    const firstDiscardResult = executeGameAction({
+        room,
+        roomId: 'ROOM1',
+        actorId: human.id,
+        action: getLegalActions(room, human.id)[0],
+        actorTransport
+    });
+
+    assert.equal(firstDiscardResult.ok, true);
+    assert.equal(human.hand.length, 11);
+    assert.equal(room.pendingAbility.cardsRemaining, 1);
+    assert.equal(emittedEvents.length, 2);
+    assert.equal(emittedEvents[1].payload.choices.length, 11);
+    assert.match(emittedEvents[1].payload.message, /Choose a card to discard \(1 remaining\)/);
+
+    const secondDiscardResult = executeGameAction({
+        room,
+        roomId: 'ROOM1',
+        actorId: human.id,
+        action: getLegalActions(room, human.id)[0],
+        actorTransport
+    });
+
+    assert.equal(secondDiscardResult.ok, true);
+    assert.equal(human.hand.length, MAX_HAND_SIZE);
+    assert.equal(human.discardPile.length, 2);
     assert.equal(room.pendingAbility, null);
     assert.equal(room.currentTurnPlayerId, 'human-1');
+    assert.equal(emittedEvents.length, 2);
 });
 
 test('a scoring bot turn also waits for hand-limit discards', () => {
@@ -1642,6 +1690,40 @@ test('the bot controller notices and completes a normal bot turn', async () => {
         selectedCardEntityIds: []
     });
     assert.equal(trajectory.entries[0].observation.isObserverTurn, true);
+});
+
+test('the bot controller chooses hand-limit discards through the shared legal actions', async () => {
+    const room = createRoom();
+    const bot = room.players[0];
+    bot.isBot = true;
+    bot.hand = Array.from({ length: MAX_HAND_SIZE }, (_, index) => (
+        createCard('dino_king_1', bot.id, `controller-hand-${index}`)
+    ));
+    bot.deck = [
+        createCard('dino_armor_1', bot.id, 'controller-draw-1'),
+        createCard('dino_bro_1', bot.id, 'controller-draw-2')
+    ];
+    room.turnState.actionPlayed = true;
+    room.turnState.minionPlayed = true;
+    const { controller, scheduledCallbacks } = createScheduledBotController(room);
+
+    controller.wake('ROOM1');
+    let steps = 0;
+    while (scheduledCallbacks.length > 0 && steps < 5) {
+        steps += 1;
+        await scheduledCallbacks.shift()();
+    }
+
+    assert.equal(steps, 3);
+    assert.equal(bot.hand.length, MAX_HAND_SIZE);
+    assert.equal(bot.discardPile.length, 2);
+    assert.equal(room.pendingAbility, null);
+    assert.equal(room.currentTurnPlayerId, 'human-1');
+    assert.equal(scheduledCallbacks.length, 0);
+    assert.deepEqual(
+        getRoomTrajectory(room).entries.map(entry => entry.chosenAction.type),
+        ['end-turn', 'resolve-ability-choice', 'resolve-ability-choice']
+    );
 });
 
 test('the bot controller resolves a bot trigger during another player turn', async () => {
