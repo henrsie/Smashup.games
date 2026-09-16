@@ -15,6 +15,8 @@ import torch
 from torch import Tensor, nn
 from torch.nn.utils.rnn import pad_sequence
 
+import modal
+
 from action_embeddings import (
     DEFAULT_REGISTRY_PATH,
     EntityEmbeddingTables,
@@ -163,7 +165,6 @@ class MaskedActionPolicy(nn.Module):
         probabilities = torch.softmax(logits, dim=-1)
         selected = torch.multinomial(probabilities, 1, generator=generator)
         return int(selected.item())
-
 
 def create_masked_action_policy(
     *,
