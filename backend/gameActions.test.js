@@ -954,6 +954,75 @@ test('a bot-style actor completes its faction draft through the shared dispatche
     assert.equal(room.activeBases.length, 3);
 });
 
+test('four players complete an eight-faction snake draft', () => {
+    const factionNames = Object.keys(factionsData);
+    const players = Array.from({ length: 4 }, (_, index) => ({
+        id: `player-${index + 1}`,
+        name: `Player ${index + 1}`,
+        hand: [],
+        deck: [],
+        discardPile: [],
+        vp: 0
+    }));
+    const draftOrder = [
+        'player-1',
+        'player-2',
+        'player-3',
+        'player-4',
+        'player-4',
+        'player-3',
+        'player-2',
+        'player-1'
+    ];
+    const room = {
+        battleLog: [],
+        draftState: {
+            availableFactions: [...factionNames],
+            currentTurnIndex: 0,
+            draftOrder,
+            picks: Object.fromEntries(players.map(player => [player.id, []]))
+        },
+        gamePhase: 'drafting',
+        pendingAbility: null,
+        players,
+        spectators: [],
+        temporaryEffects: []
+    };
+    initializeSeededRandom(room, 'four-player-draft');
+
+    assert.equal(factionNames.length, 8);
+    draftOrder.forEach((playerId, pickIndex) => {
+        const result = executeGameAction({
+            room,
+            roomId: 'ROOM4',
+            actorId: playerId,
+            action: {
+                type: 'draft-faction',
+                factionName: factionNames[pickIndex]
+            }
+        });
+
+        assert.equal(result.ok, true);
+        assert.equal(result.draftComplete, pickIndex === draftOrder.length - 1);
+    });
+
+    assert.equal(room.gamePhase, 'playing');
+    assert.equal(room.currentTurnPlayerId, 'player-1');
+    assert.equal(room.draftState.availableFactions.length, 0);
+    assert.deepEqual(room.players.map(player => player.factions), [
+        [factionNames[0], factionNames[7]],
+        [factionNames[1], factionNames[6]],
+        [factionNames[2], factionNames[5]],
+        [factionNames[3], factionNames[4]]
+    ]);
+    assert.equal(new Set(room.players.flatMap(player => player.factions)).size, 8);
+    room.players.forEach(player => {
+        assert.equal(player.hand.length, 5);
+        assert.equal(player.deck.length, 35);
+    });
+    assert.equal(room.activeBases.length, 3);
+});
+
 test('the same room seed reproduces drafted decks, opening hands, and bases', () => {
     const createDraftRoom = () => {
         const room = {
@@ -1038,6 +1107,58 @@ test('getLegalActions returns executable card, Talent, and end-turn actions', ()
     )));
     assert.ok(actions.some(action => action.type === 'end-turn'));
     assert.equal(getLegalActions(room, 'human-1').length, 0);
+});
+
+test('Tenacious Z is a once-per-turn extra minion play from the discard pile', () => {
+    const room = createRoom();
+    const firstTenaciousZ = createCard('zombie_tenacious_z_1', 'bot-1', 'tenacious-z-1');
+    const secondTenaciousZ = createCard('zombie_tenacious_z_1', 'bot-1', 'tenacious-z-2');
+    const normalMinion = createCard('dino_king_1', 'bot-1');
+    room.players[0].discardPile.push(firstTenaciousZ, secondTenaciousZ);
+    room.players[0].hand.push(normalMinion);
+
+    const initialActions = getLegalActions(room, 'bot-1');
+    const normalPlay = initialActions.find(action => (
+        action.type === 'play-card'
+        && action.cardInstanceId === normalMinion.instanceId
+        && action.fromDiscard === false
+        && action.baseIndex === 0
+    ));
+
+    assert.ok(normalPlay);
+    assert.equal(executeGameAction({
+        room,
+        roomId: 'ROOM1',
+        actorId: 'bot-1',
+        action: normalPlay
+    }).ok, true);
+    assert.equal(room.turnState.minionPlayed, true);
+
+    const specialPlay = getLegalActions(room, 'bot-1').find(action => (
+        action.type === 'play-card'
+        && action.cardInstanceId === firstTenaciousZ.instanceId
+        && action.fromDiscard === true
+        && action.baseIndex === 0
+    ));
+    assert.ok(specialPlay);
+    assert.equal(executeGameAction({
+        room,
+        roomId: 'ROOM1',
+        actorId: 'bot-1',
+        action: specialPlay
+    }).ok, true);
+    assert.equal(room.turnState.ongoingDiscardMinionPlayed, false);
+    assert.equal(room.turnState.ongoingAbilityUses['special-discard-play:tenacious-z'], 1);
+    assert.ok(room.activeBases[0].playedCards.some(card => (
+        card.instanceId === firstTenaciousZ.instanceId
+    )));
+
+    const remainingActions = getLegalActions(room, 'bot-1');
+    assert.equal(remainingActions.some(action => (
+        action.type === 'play-card'
+        && action.cardInstanceId === secondTenaciousZ.instanceId
+        && action.fromDiscard === true
+    )), false);
 });
 
 test('legal-action model encodings distinguish duplicate cards and decision outcomes', () => {
@@ -1520,7 +1641,7 @@ test('the trajectory links consecutive player decisions and records VP rewards',
     assert.equal(activeTrajectory.gameId, 'ROOM1');
     assert.equal(activeTrajectory.metadata.trajectorySchemaVersion, 5);
     assert.equal(activeTrajectory.metadata.observationSchemaVersion, 5);
-    assert.equal(activeTrajectory.metadata.entityIdSchemaVersion, 4);
+    assert.equal(activeTrajectory.metadata.entityIdSchemaVersion, 5);
     assert.equal(activeTrajectory.metadata.eventSchemaVersion, 1);
     assert.equal(activeTrajectory.metadata.eventHistorySource, 'native-v1');
     assert.equal(activeTrajectory.metadata.rewardSchemaVersion, 2);

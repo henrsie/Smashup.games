@@ -21,7 +21,7 @@ test('Python bridge manager exposes reset, validated index steps, results, and c
 
     assert.equal(created.environmentId, 'test-environment');
     assert.equal(created.state.observation.decisionType, 'draftFaction');
-    assert.equal(created.state.legalActions.length, 7);
+    assert.equal(created.state.legalActions.length, 8);
 
     const environment = manager.get(created.environmentId);
     assert.throws(

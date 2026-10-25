@@ -8,7 +8,7 @@ const {
 } = require('./rlBotPolicy.js');
 
 const MIN_BOT_MATCH_PLAYERS = 2;
-const MAX_BOT_MATCH_PLAYERS = 3;
+const MAX_BOT_MATCH_PLAYERS = 4;
 const BOT_MATCH_MAX_DECISIONS = 5_000;
 const BOT_MATCH_TIMEOUT_MS = 20_000;
 const BOT_MATCH_RL_TIMEOUT_MS = 120_000;
@@ -40,7 +40,7 @@ function validateBotMatchRequest(payload = {}, {
         || policyVersions.length > MAX_BOT_MATCH_PLAYERS) {
         throw new BotMatchError(
             'invalid_bot_count',
-            `Bot Mode requires ${MIN_BOT_MATCH_PLAYERS} or ${MAX_BOT_MATCH_PLAYERS} bots.`
+            `Bot Mode requires between ${MIN_BOT_MATCH_PLAYERS} and ${MAX_BOT_MATCH_PLAYERS} bots.`
         );
     }
     const availablePolicyVersionSet = new Set(availablePolicyVersions);

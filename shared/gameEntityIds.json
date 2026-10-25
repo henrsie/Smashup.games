@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 4,
+  "schemaVersion": 5,
   "unknownId": 0,
   "actionTypes": {
     "play-card": 1,
@@ -64,7 +64,8 @@
     "Pirates": 4,
     "Robots": 5,
     "Wizards": 6,
-    "Zombies": 7
+    "Zombies": 7,
+    "Tricksters": 8
   },
   "cards": {
     "dino_war_raptor_1": 1,
@@ -148,7 +149,19 @@
     "zombie_outbreak_1": 79,
     "zombie_overrun_1": 80,
     "zombie_they_keep_coming_1": 81,
-    "zombie_they_re_coming_to_get_you_1": 82
+    "zombie_they_re_coming_to_get_you_1": 82,
+    "trickster_leprechaun_1": 83,
+    "trickster_brownie_1": 84,
+    "trickster_gnome_1": 85,
+    "trickster_gremlin_1": 86,
+    "trickster_block_the_path_1": 87,
+    "trickster_disenchant_1": 88,
+    "trickster_enshrouding_mist_1": 89,
+    "trickster_flame_trap_1": 90,
+    "trickster_hideout_1": 91,
+    "trickster_mark_of_sleep_1": 92,
+    "trickster_pay_the_piper_1": 93,
+    "trickster_take_the_shinies_1": 94
   },
   "bases": {
     "base_the_plant": 1,

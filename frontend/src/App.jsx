@@ -36,6 +36,17 @@ const BOT_POLICY_DESCRIPTIONS = {
   rl_v1_stochastic: 'Loads the trained checkpoint and samples from its legal-action probabilities.'
 };
 const DEFAULT_BOT_MODE_POLICIES = ['random-v1', 'greedy_heuristic_1'];
+const getSpecialDiscardPlayAbility = card => (card?.abilities || []).find(ability => (
+  ability.trigger === 'duringOwnersPlayCardsPhase'
+  && (ability.effects || []).some(effect => (
+    effect.type === 'playFromDiscard'
+    && effect.card === 'self'
+    && effect.cardType === 'minion'
+  ))
+));
+const getSpecialDiscardPlayUseKey = (card, ability) => (
+  `special-discard-play:${ability?.limit?.key || card.cardId || card.instanceId}`
+);
 const getPlayerDisplayName = player => (
   `${player.name}${player.isBot
     ? ` (${(BOT_POLICY_LABELS[player.policyVersion] || 'Random').toLowerCase()})`
@@ -309,8 +320,8 @@ function BotModeSetup({
             <legend style={{ color: '#243b53', fontSize: '18px', fontWeight: 'bold', marginBottom: '12px' }}>
               Number of bots
             </legend>
-            <div style={{ display: 'flex', gap: '10px' }}>
-              {[2, 3].map(count => (
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: '10px' }}>
+              {[2, 3, 4].map(count => (
                 <button
                   key={count}
                   type="button"
@@ -1312,9 +1323,22 @@ function App() {
           ))
         )))
         .map(({ baseIndex }) => baseIndex);
+    const selectedDiscardSpecialAbility = selectedCardSource === 'discard'
+      ? getSpecialDiscardPlayAbility(selectedCardToPlay)
+      : null;
+    const selectedDiscardSpecialAvailable = Boolean(
+      selectedDiscardSpecialAbility
+      && !turnState.ongoingAbilityUses?.[
+        getSpecialDiscardPlayUseKey(selectedCardToPlay, selectedDiscardSpecialAbility)
+      ]
+    );
     const targetBaseOptions = activeBases
       .map((base, baseIndex) => ({ base, baseIndex }))
-      .filter(({ baseIndex }) => selectedCardSource !== 'discard' || discardPlayBaseIndices.includes(baseIndex))
+      .filter(({ baseIndex }) => (
+        selectedCardSource !== 'discard'
+        || selectedDiscardSpecialAvailable
+        || discardPlayBaseIndices.includes(baseIndex)
+      ))
       .filter(({ baseIndex }) => (
         !requiredExtraMinionPlay
         || (selectedCardSource === 'hand' && baseIndex === requiredExtraMinionPlay.allowedBaseIndex)
@@ -1866,55 +1890,64 @@ function App() {
                       <p style={{ fontStyle: 'italic', color: '#777' }}>Your discard pile is currently empty.</p>
                     ) : (
                       <div style={{ display: 'flex', flexWrap: 'wrap', gap: '10px', margin: '20px 0' }}>
-                        {myDiscard.map((card, idx) => (
-                          <div
-                            key={card.instanceId || idx}
-                            style={{
-                              border: '2px solid #333',
-                              borderRadius: '8px',
-                              padding: '10px',
-                              width: '130px',
-                              background: card.type === 'minion' ? '#eef6fc' : '#fcf4ee',
-                              boxShadow: '0 2px 4px rgba(0,0,0,0.1)'
-                            }}
-                          >
-                            <div style={{ fontWeight: 'bold', fontSize: '13px' }}>{card.name}</div>
-                            <div style={{ fontSize: '11px', color: '#555', textTransform: 'uppercase', margin: '3px 0' }}>
-                              {card.type} {card.power !== undefined ? `(${card.power} Pwr)` : ''}
+                        {myDiscard.map((card, idx) => {
+                          const specialDiscardAbility = getSpecialDiscardPlayAbility(card);
+                          const specialDiscardAvailable = Boolean(
+                            specialDiscardAbility
+                            && !turnState.ongoingAbilityUses?.[
+                              getSpecialDiscardPlayUseKey(card, specialDiscardAbility)
+                            ]
+                          );
+                          return (
+                            <div
+                              key={card.instanceId || idx}
+                              style={{
+                                border: '2px solid #333',
+                                borderRadius: '8px',
+                                padding: '10px',
+                                width: '130px',
+                                background: card.type === 'minion' ? '#eef6fc' : '#fcf4ee',
+                                boxShadow: '0 2px 4px rgba(0,0,0,0.1)'
+                              }}
+                            >
+                              <div style={{ fontWeight: 'bold', fontSize: '13px' }}>{card.name}</div>
+                              <div style={{ fontSize: '11px', color: '#555', textTransform: 'uppercase', margin: '3px 0' }}>
+                                {card.type} {card.power !== undefined ? `(${card.power} Pwr)` : ''}
+                              </div>
+                              <div style={{ fontSize: '9px', color: '#777', fontStyle: 'italic' }}>{card.faction}</div>
+                              <div style={{ fontSize: '10px', marginTop: '4px' }}>{card.ability}</div>
+                              {card.type === 'minion'
+                                && isMyTurn
+                                && gamePhase === 'playing'
+                                && !requiredExtraMinionPlay
+                                && (specialDiscardAvailable || discardPlayBaseIndices.length > 0) && (
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      setSelectedCardToPlay(card);
+                                      setSelectedCardSource('discard');
+                                      setTargetingMode('base');
+                                      setShowDiscardModal(false);
+                                    }}
+                                    style={{
+                                      backgroundColor: '#6f42c1',
+                                      border: 'none',
+                                      borderRadius: '4px',
+                                      color: 'white',
+                                      cursor: 'pointer',
+                                      fontSize: '10px',
+                                      fontWeight: 'bold',
+                                      marginTop: '8px',
+                                      padding: '6px',
+                                      width: '100%'
+                                    }}
+                                  >
+                                    {specialDiscardAvailable ? 'Play as Extra Minion' : 'Play from Discard'}
+                                  </button>
+                                )}
                             </div>
-                            <div style={{ fontSize: '9px', color: '#777', fontStyle: 'italic' }}>{card.faction}</div>
-                            <div style={{ fontSize: '10px', marginTop: '4px' }}>{card.ability}</div>
-                            {card.type === 'minion'
-                              && isMyTurn
-                              && gamePhase === 'playing'
-                              && !requiredExtraMinionPlay
-                              && discardPlayBaseIndices.length > 0 && (
-                                <button
-                                  type="button"
-                                  onClick={() => {
-                                    setSelectedCardToPlay(card);
-                                    setSelectedCardSource('discard');
-                                    setTargetingMode('base');
-                                    setShowDiscardModal(false);
-                                  }}
-                                  style={{
-                                    backgroundColor: '#6f42c1',
-                                    border: 'none',
-                                    borderRadius: '4px',
-                                    color: 'white',
-                                    cursor: 'pointer',
-                                    fontSize: '10px',
-                                    fontWeight: 'bold',
-                                    marginTop: '8px',
-                                    padding: '6px',
-                                    width: '100%'
-                                  }}
-                                >
-                                  Play from Discard
-                                </button>
-                              )}
-                          </div>
-                        ))}
+                          );
+                        })}
                       </div>
                     )}
 

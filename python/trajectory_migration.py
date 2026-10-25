@@ -21,7 +21,7 @@ WIN_REWARD = 1.0
 LOSS_REWARD = -1.0
 RECENT_EVENT_LIMIT = 32
 SUPPORTED_SOURCE_TRAJECTORY_VERSION = 4
-SUPPORTED_CURRENT_ENTITY_SCHEMA_VERSION = 3
+SUPPORTED_PRIOR_ENTITY_SCHEMA_VERSIONS = (3, 4)
 
 
 def _load_registry(path: Path | str = REGISTRY_PATH) -> dict[str, Any]:
@@ -662,7 +662,7 @@ def migrate_trajectory(
         source_entity_version = metadata.get("entityIdSchemaVersion")
         if source_entity_version not in (
             registry["schemaVersion"],
-            SUPPORTED_CURRENT_ENTITY_SCHEMA_VERSION,
+            *SUPPORTED_PRIOR_ENTITY_SCHEMA_VERSIONS,
         ):
             raise ValueError("The v5 trajectory uses an incompatible entity registry.")
         source_reward_version = metadata.get("rewardSchemaVersion", 1)
@@ -675,7 +675,7 @@ def migrate_trajectory(
             return migrated
 
         upgraded_entries = copy.deepcopy(_list(migrated.get("entries")))
-        if source_entity_version == SUPPORTED_CURRENT_ENTITY_SCHEMA_VERSION:
+        if source_entity_version in SUPPORTED_PRIOR_ENTITY_SCHEMA_VERSIONS:
             entity_upgraded_entries = []
             for raw_entry in upgraded_entries:
                 if not isinstance(raw_entry, Mapping):
@@ -687,10 +687,15 @@ def migrate_trajectory(
                 entry["nextObservation"] = _set_observation_entity_schema(
                     entry.get("nextObservation"), registry["schemaVersion"]
                 )
-                entity_upgraded_entries.append(_upgrade_entry_actions(entry, registry))
+                entity_upgraded_entries.append(
+                    _upgrade_entry_actions(entry, registry)
+                    if source_entity_version == 3
+                    else entry
+                )
             upgraded_entries = entity_upgraded_entries
             metadata["entityIdSchemaVersion"] = registry["schemaVersion"]
-            metadata["actionEncodingSource"] = "choice-features-backfill-v1"
+            if source_entity_version == 3:
+                metadata["actionEncodingSource"] = "choice-features-backfill-v1"
             metadata["entityMigration"] = {
                 "sourceEntityIdSchemaVersion": source_entity_version,
                 "targetEntityIdSchemaVersion": registry["schemaVersion"],
