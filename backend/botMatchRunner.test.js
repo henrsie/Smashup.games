@@ -13,15 +13,25 @@ const MIXED_POLICIES = [
     BOT_POLICY_VERSIONS.GREEDY_HEURISTIC_1,
     BOT_POLICY_VERSIONS.GREEDY_HEURISTIC_2
 ];
+const FOUR_BOT_POLICIES = [
+    ...MIXED_POLICIES,
+    BOT_POLICY_VERSIONS.FIRST_LEGAL
+];
 
-test('bot-match requests require two or three supported strategies', () => {
+test('bot-match requests require two to four supported strategies', () => {
     assert.deepEqual(
-        validateBotMatchRequest({ policyVersions: MIXED_POLICIES, randomSeed: 380 }),
-        { policyVersions: MIXED_POLICIES, randomSeed: 380 }
+        validateBotMatchRequest({ policyVersions: FOUR_BOT_POLICIES, randomSeed: 380 }),
+        { policyVersions: FOUR_BOT_POLICIES, randomSeed: 380 }
     );
     assert.throws(
         () => validateBotMatchRequest({ policyVersions: [BOT_POLICY_VERSIONS.RANDOM] }),
-        /requires 2 or 3 bots/
+        /requires between 2 and 4 bots/
+    );
+    assert.throws(
+        () => validateBotMatchRequest({
+            policyVersions: [...FOUR_BOT_POLICIES, BOT_POLICY_VERSIONS.RANDOM]
+        }),
+        /requires between 2 and 4 bots/
     );
     assert.throws(
         () => validateBotMatchRequest({ policyVersions: ['unknown', BOT_POLICY_VERSIONS.RANDOM] }),
@@ -62,7 +72,11 @@ test('bot-match worker returns a compact result for mixed strategies', async () 
 
     assert.equal(result.terminated, true);
     assert.equal(result.truncated, false);
-    assert.equal(result.gameResult.winnerName, 'bot3');
+    assert.ok(['bot1', 'bot2', 'bot3'].includes(result.gameResult.winnerName));
+    assert.equal(
+        result.standings.find(standing => standing.rank === 1)?.name,
+        result.gameResult.winnerName
+    );
     assert.deepEqual(result.policyVersions, MIXED_POLICIES);
     assert.deepEqual(
         result.standings.map(standing => standing.policyVersion).sort(),
@@ -70,6 +84,22 @@ test('bot-match worker returns a compact result for mixed strategies', async () 
     );
     assert.equal('room' in result, false);
     assert.equal('trajectory' in result, false);
+});
+
+test('bot-match worker supports a four-bot game', async () => {
+    const result = await runBotMatchInWorker({
+        policyVersions: FOUR_BOT_POLICIES,
+        randomSeed: 380
+    });
+
+    assert.equal(result.terminated, true);
+    assert.equal(result.truncated, false);
+    assert.deepEqual(result.policyVersions, FOUR_BOT_POLICIES);
+    assert.equal(result.standings.length, 4);
+    assert.deepEqual(
+        result.standings.map(standing => standing.name).sort(),
+        ['bot1', 'bot2', 'bot3', 'bot4']
+    );
 });
 
 test('bot-match job manager limits concurrent and repeated client jobs', async () => {

@@ -84,7 +84,7 @@ test('reset exposes the first decision and step advances by legal action index',
     assert.equal(initial.info.decisionCount, 0);
     assert.equal(initial.observation.decisionType, 'draftFaction');
     assert.equal(initial.observation.stepIndex, 0);
-    assert.equal(initial.legalActions.length, 7);
+    assert.equal(initial.legalActions.length, 8);
     assert.throws(() => environment.step(-1), /actionIndex/);
     assert.throws(() => environment.step(initial.legalActions.length), /actionIndex/);
 
@@ -100,7 +100,7 @@ test('reset exposes the first decision and step advances by legal action index',
     assert.equal(transition.info.actionIndex, 2);
     assert.equal(transition.info.decisionCount, 1);
     assert.equal(transition.observation.observerPlayerId, 'headless-bot-2');
-    assert.equal(transition.legalActions.length, 6);
+    assert.equal(transition.legalActions.length, 7);
     assert.deepEqual(environment.room.draftState.picks['headless-bot-1'], [chosenAction.factionName]);
     assert.deepEqual(environment.getResult().trajectory.entries[0].chosenAction, chosenAction);
 });
@@ -191,7 +191,7 @@ test('a headless game completes without socket or scoring timers', async () => {
     assert.equal(result.terminated, true);
     assert.equal(result.truncated, false);
     assert.equal(result.room.gamePhase, 'finished');
-    assert.equal(result.gameResult.winnerName, 'bot2');
+    assert.equal(result.gameResult.winnerName, 'bot1');
     assert.ok(result.decisionCount < 1_000);
     assert.equal(result.trajectory.entries.length, result.decisionCount);
     assert.equal(result.trajectory.metadata.randomSeed, 42);
@@ -209,7 +209,7 @@ test('empty decks recycle so seed 380 reaches a winner instead of stalling', asy
 
     assert.equal(result.terminated, true);
     assert.equal(result.truncated, false);
-    assert.equal(result.gameResult.winnerName, 'bot3');
+    assert.equal(result.gameResult.winnerName, 'bot1');
     assert.ok(result.decisionCount < 1_000);
     assert.equal(result.trajectory, null);
 });

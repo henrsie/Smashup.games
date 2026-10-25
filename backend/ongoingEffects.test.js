@@ -86,7 +86,9 @@ test('every declared continuous ongoing effect has a resolver archetype', () => 
     const supportedEffectTypes = new Set([
         'addTrait',
         'cancelBaseAbilities',
+        'cancelActionEffect',
         'grantDiscardPlayPermission',
+        'grantExtraPlay',
         'grantProtection',
         'ignoreBaseAbility',
         'modifyPower',
@@ -488,6 +490,41 @@ test('Hidden Ninja plays a selected minion before a base scores', () => {
     ), true);
     assert.equal(room.players[0].discardPile[0].instanceId, hiddenNinja.instanceId);
     assert.equal(room.activeBases[0].playedCards[0].instanceId, kingRex.instanceId);
+});
+
+test('Hidden Ninja only offers minions that can be played on the scoring base', () => {
+    const blockThePath = createCard('trickster_block_the_path_1', 'player-2');
+    blockThePath.namedFaction = 'Aliens';
+    const room = createRoom([createBase('base_the_homeworld', [blockThePath])]);
+    const hiddenNinja = createCard('ninja_hidden_ninja_1', 'player-1');
+    const acolyte = createCard('ninja_acolyte_1', 'player-1');
+    const collector = createCard('alien_collector_1', 'player-1');
+    acolyte.faction = 'Ninjas';
+    collector.faction = 'Aliens';
+    room.players[0].hand.push(hiddenNinja, acolyte, collector);
+    room.currentTurnPlayerId = 'player-1';
+
+    queueBeforeBaseScoringSpecials(room, [0]);
+    assert.equal(processNextTriggeredAbility(room, 'ROOM'), true);
+    assert.equal(resolveTriggeredAbilityChoice(
+        room,
+        'ROOM',
+        { id: 'player-1' },
+        { choiceId: 'accept' }
+    ), true);
+
+    const legalChoices = getLegalActions(room, 'player-1');
+    assert.deepEqual(
+        legalChoices.map(action => action.choice.cardInstanceId),
+        [acolyte.instanceId]
+    );
+    assert.equal(resolveTriggeredAbilityChoice(
+        room,
+        'ROOM',
+        { id: 'player-1' },
+        legalChoices[0].choice
+    ), true);
+    assert.equal(room.activeBases[0].playedCards.at(-1).instanceId, acolyte.instanceId);
 });
 
 test('Pirate King can move to a scoring base before it scores', () => {

@@ -66,7 +66,7 @@ test('the explicit entity registry covers every action type, faction, card, and 
     ));
     const baseIds = basesData.map(base => base.id);
 
-    assert.equal(ENTITY_ID_SCHEMA_VERSION, 4);
+    assert.equal(ENTITY_ID_SCHEMA_VERSION, 5);
     assert.equal(UNKNOWN_ENTITY_ID, 0);
     assertStableNamespace(ACTION_TYPE_IDS, actionTypes);
     assertStableNamespace(CHOICE_TYPE_IDS, [

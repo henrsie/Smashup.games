@@ -141,6 +141,26 @@ const factionsData = {
       { id: 'zombie_they_keep_coming_1', name: 'They Keep Coming', type: 'action', count: 2, ability: 'Play an extra minion from your discard pile.', subtype: 'neither', discard: 'yes' },
       { id: 'zombie_they_re_coming_to_get_you_1', name: "They're Coming To Get You", type: 'action', count: 1, ability: 'Play on a base. Ongoing: Once on your turn, you may play a minion here from your discard pile instead of from your hand.', subtype: 'base', discard: 'no' }
     ]
+  },
+  Tricksters: {
+    name: "Tricksters",
+    cards: [
+      // Minions (Total: 10)
+      { id: 'trickster_leprechaun_1', name: 'Leprechaun', type: 'minion', power: 5, count: 1, ability: 'Ongoing: After another player plays a minion here with less power than this minion\'s power, destroy it (resolve its ability first).', subtype: 'base', discard: 'no' },
+      { id: 'trickster_brownie_1', name: 'Brownie', type: 'minion', power: 4, count: 2, ability: 'Ongoing: After another player plays a card that affects this minion, that player discards two random cards.', subtype: 'base', discard: 'no' },
+      { id: 'trickster_gnome_1', name: 'Gnome', type: 'minion', power: 3, count: 3, ability: 'You may destroy a minion on this base with power less than the number of minions you have here.', subtype: 'base', discard: 'no' },
+      { id: 'trickster_gremlin_1', name: 'Gremlin', type: 'minion', power: 2, count: 4, ability: 'Ongoing: After this minion is destroyed, draw a card and each other player discards a random card.', subtype: 'base', discard: 'no' },
+
+      // Actions (Total: 10)
+      { id: 'trickster_block_the_path_1', name: 'Block the Path', type: 'action', count: 1, ability: 'Play on a base and name a faction. Ongoing: Minions of that faction cannot be played here.', subtype: 'base', discard: 'no' },
+      { id: 'trickster_disenchant_1', name: 'Disenchant', type: 'action', count: 2, ability: 'Destroy an action that has been played on a minion or base.', subtype: 'neither', discard: 'yes' },
+      { id: 'trickster_enshrouding_mist_1', name: 'Enshrouding Mist', type: 'action', count: 2, ability: 'Play on a base. Ongoing: On your turn, you may play an extra minion here.', subtype: 'base', discard: 'no' },
+      { id: 'trickster_flame_trap_1', name: 'Flame Trap', type: 'action', count: 1, ability: 'Play on a base. Ongoing: After another player plays a minion here, destroy it (resolve its ability first) and this card.', subtype: 'base', discard: 'no' },
+      { id: 'trickster_hideout_1', name: 'Hideout', type: 'action', count: 1, ability: 'Play on a base. Ongoing: If another player\'s action would affect your minions here, destroy this card and the action does not affect your minions.', subtype: 'base', discard: 'no' },
+      { id: 'trickster_mark_of_sleep_1', name: 'Mark of Sleep', type: 'action', count: 1, ability: 'Choose a player. That player cannot play actions on his or her next turn.', subtype: 'player', discard: 'yes' },
+      { id: 'trickster_pay_the_piper_1', name: 'Pay the Piper', type: 'action', count: 1, ability: 'Play on a base. Ongoing: After another player plays a minion here, that player discards a card.', subtype: 'base', discard: 'no' },
+      { id: 'trickster_take_the_shinies_1', name: 'Take the Shinies', type: 'action', count: 1, ability: 'Each other player discards two random cards.', subtype: 'neither', discard: 'yes' }
+    ]
   }
 };
 
@@ -247,7 +267,21 @@ const abilityDefinitions = {
   zombie_outbreak_1: [ability('onPlay', { type: 'grantExtraPlay', cardType: 'minion', amount: 1, destination: { kind: 'base', filter: 'controllerHasNoMinions' }, duration: 'thisTurn' })],
   zombie_overrun_1: [ability('ongoing', { type: 'preventPlay', target: { kind: 'minion', owner: 'otherPlayers', location: 'attachedBase' }, duration: 'whileAttached' }), ability('startTurn', { type: 'destroyAction', target: 'self' })],
   zombie_they_keep_coming_1: [ability('onPlay', { type: 'grantExtraPlayFromDiscard', cardType: 'minion', amount: 1, duration: 'thisTurn' })],
-  zombie_they_re_coming_to_get_you_1: [ability('ongoing', { type: 'grantDiscardPlayPermission', cardType: 'minion', destination: 'attachedBase', replacementFor: 'playFromHand', limit: { scope: 'turn', maxUses: 1 } })]
+  zombie_they_re_coming_to_get_you_1: [ability('ongoing', { type: 'grantDiscardPlayPermission', cardType: 'minion', destination: 'attachedBase', replacementFor: 'playFromHand', limit: { scope: 'turn', maxUses: 1 } })],
+
+  // Tricksters
+  trickster_leprechaun_1: [ability('afterMinionPlayed', { type: 'destroyMinion', target: 'playedMinion' }, { condition: { playedMinion: { owner: 'otherPlayer', power: { lessThan: 'self' } } } })],
+  trickster_brownie_1: [ability('afterAffected', { type: 'discardRandomCards', target: 'effectController', amount: 2 }, { condition: { effectController: 'otherPlayer' } })],
+  trickster_gnome_1: [ability('onPlay', { type: 'destroyMinion', target: { kind: 'minion', location: 'sameBase', power: { lessThan: { type: 'countMinions', owner: 'controller', location: 'sameBase' } } } }, { optional: true })],
+  trickster_gremlin_1: [ability('afterDestroyed', [{ type: 'drawCards', target: 'controller', amount: 1 }, { type: 'discardRandomCards', target: 'otherPlayers', amount: 1 }])],
+  trickster_block_the_path_1: [ability('onPlay', { type: 'nameFaction', target: 'self' }), ability('ongoing', { type: 'preventPlay', target: { kind: 'minion', faction: 'namedFaction', location: 'attachedBase' }, duration: 'whileAttached' })],
+  trickster_disenchant_1: [ability('onPlay', { type: 'destroyAction', target: { kind: 'action', location: 'inPlay', quantity: 1 } })],
+  trickster_enshrouding_mist_1: [ability('ongoing', { type: 'grantExtraPlay', cardType: 'minion', amount: 1, destination: 'attachedBase', limit: { scope: 'turn', maxUses: 1 } })],
+  trickster_flame_trap_1: [ability('afterMinionPlayed', [{ type: 'destroyMinion', target: 'playedMinion' }, { type: 'destroyAction', target: 'self' }], { condition: { playedMinion: { owner: 'otherPlayer' } } })],
+  trickster_hideout_1: [ability('ongoing', { type: 'cancelActionEffect', target: { kind: 'minion', owner: 'controller', location: 'attachedBase' }, source: 'otherPlayersActions', cost: { type: 'destroyAction', target: 'self' } })],
+  trickster_mark_of_sleep_1: [ability('onPlay', { type: 'preventActionPlay', target: 'selectedPlayer', duration: 'nextTurn' })],
+  trickster_pay_the_piper_1: [ability('afterMinionPlayed', { type: 'discardFromHand', target: 'playedMinionOwner', amount: 1 }, { condition: { playedMinion: { owner: 'otherPlayer' } } })],
+  trickster_take_the_shinies_1: [ability('onPlay', { type: 'discardRandomCards', target: 'otherPlayers', amount: 2 })]
 };
 
 for (const faction of Object.values(factionsData)) {

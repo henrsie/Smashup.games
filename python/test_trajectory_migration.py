@@ -5,7 +5,11 @@ from __future__ import annotations
 import copy
 import unittest
 
+from action_embeddings import load_entity_registry
 from trajectory_migration import migrate_trajectory
+
+
+CURRENT_ENTITY_SCHEMA_VERSION = load_entity_registry()["schemaVersion"]
 
 
 def old_observation(observer_id: str, current_player_id: str) -> dict:
@@ -107,7 +111,10 @@ class TrajectoryMigrationTests(unittest.TestCase):
         self.assertEqual(migrated["schemaVersion"], 5)
         self.assertEqual(migrated["metadata"]["trajectorySchemaVersion"], 5)
         self.assertEqual(migrated["metadata"]["observationSchemaVersion"], 5)
-        self.assertEqual(migrated["metadata"]["entityIdSchemaVersion"], 4)
+        self.assertEqual(
+            migrated["metadata"]["entityIdSchemaVersion"],
+            CURRENT_ENTITY_SCHEMA_VERSION,
+        )
         self.assertEqual(migrated["metadata"]["eventSchemaVersion"], 1)
         self.assertEqual(migrated["metadata"]["rewardSchemaVersion"], 2)
         self.assertEqual(migrated["metadata"]["victoryPointRewardScale"], 1 / 15)
@@ -136,7 +143,7 @@ class TrajectoryMigrationTests(unittest.TestCase):
         self.assertNotIn("privateEntityPlayerId", private_event)
         self.assertTrue(all(
             observation["schemaVersion"] == 5
-            and observation["entityIdSchemaVersion"] == 4
+            and observation["entityIdSchemaVersion"] == CURRENT_ENTITY_SCHEMA_VERSION
             and observation["eventSchemaVersion"] == 1
             for observation in (
                 entry["observation"]
@@ -150,7 +157,7 @@ class TrajectoryMigrationTests(unittest.TestCase):
         current["metadata"].update({
             "trajectorySchemaVersion": 5,
             "observationSchemaVersion": 5,
-            "entityIdSchemaVersion": 4,
+            "entityIdSchemaVersion": CURRENT_ENTITY_SCHEMA_VERSION,
             "eventSchemaVersion": 1,
             "eventHistorySource": "native-v1",
             "rewardSchemaVersion": 2,
@@ -174,7 +181,10 @@ class TrajectoryMigrationTests(unittest.TestCase):
 
         migrated = migrate_trajectory(current)
 
-        self.assertEqual(migrated["metadata"]["entityIdSchemaVersion"], 4)
+        self.assertEqual(
+            migrated["metadata"]["entityIdSchemaVersion"],
+            CURRENT_ENTITY_SCHEMA_VERSION,
+        )
         self.assertEqual(migrated["metadata"]["rewardSchemaVersion"], 2)
         self.assertEqual(
             migrated["metadata"]["actionEncodingSource"],
@@ -190,7 +200,7 @@ class TrajectoryMigrationTests(unittest.TestCase):
         current["metadata"].update({
             "trajectorySchemaVersion": 5,
             "observationSchemaVersion": 5,
-            "entityIdSchemaVersion": 4,
+            "entityIdSchemaVersion": CURRENT_ENTITY_SCHEMA_VERSION,
             "eventSchemaVersion": 1,
             "eventHistorySource": "native-v1",
         })
